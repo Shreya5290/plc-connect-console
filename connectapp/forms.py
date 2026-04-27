@@ -5,6 +5,7 @@ from django import forms
 
 IPV4_PATTERN = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 HOST_PATTERN = re.compile(r'^[A-Za-z0-9.\-]+$')
+CONFIG_NAME_PATTERN = re.compile(r'^[A-Za-z0-9_.\- ]+$')
 
 
 class PlcReadForm(forms.Form):
@@ -134,3 +135,47 @@ class OpcUaFetchForm(forms.Form):
 
 class ClearHistoryForm(forms.Form):
     protocol = forms.ChoiceField(choices=(('plc', 'PLC'), ('opcua', 'OPC UA')))
+
+
+class PlcConfigSaveForm(forms.Form):
+    config_name = forms.CharField(
+        label='Configuration Name',
+        max_length=80,
+        required=True,
+        widget=forms.TextInput(
+            attrs={
+                'id': 'config_name',
+                'placeholder': 'line-1-shift-a',
+                'autocomplete': 'off',
+            }
+        ),
+    )
+
+    def clean_config_name(self):
+        value = self.cleaned_data['config_name'].strip()
+        if not value:
+            raise forms.ValidationError('Enter a configuration file name.')
+        if not CONFIG_NAME_PATTERN.match(value):
+            raise forms.ValidationError('Use letters, numbers, space, dash, underscore, or dot only.')
+        return value
+
+
+class PlcConfigLoadForm(forms.Form):
+    config_file = forms.ChoiceField(label='Saved Configurations', choices=(), required=True)
+
+    def __init__(self, *args, **kwargs):
+        file_choices = kwargs.pop('file_choices', ())
+        super().__init__(*args, **kwargs)
+        self.fields['config_file'].choices = file_choices or (('', 'No saved YAML files found'),)
+        self.fields['config_file'].widget.attrs.update({'id': 'config_file'})
+
+
+class PlcConfigImportForm(forms.Form):
+    config_upload = forms.FileField(label='Import YAML File', required=True)
+
+    def clean_config_upload(self):
+        file_obj = self.cleaned_data['config_upload']
+        name = (getattr(file_obj, 'name', '') or '').lower()
+        if not (name.endswith('.yaml') or name.endswith('.yml')):
+            raise forms.ValidationError('Upload a .yaml or .yml file.')
+        return file_obj

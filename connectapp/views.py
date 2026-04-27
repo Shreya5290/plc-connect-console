@@ -1,15 +1,27 @@
 import re
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from time import perf_counter
 
+import yaml
+from django.conf import settings
 from django.contrib import messages
 from django.shortcuts import render
 from django.utils import timezone
 from django.views import View
 from pycomm3 import LogixDriver, Tag
 
-from .forms import ClearHistoryForm, OpcUaFetchForm, PlcReadForm
+from .forms import (
+    ClearHistoryForm,
+    OpcUaFetchForm,
+    PlcConfigImportForm,
+    PlcConfigLoadForm,
+    PlcConfigSaveForm,
+    PlcReadForm,
+)
 
 try:
     from opcua import Client as OpcUaClient, ua
@@ -177,11 +189,33 @@ class OpcUaService:
         return True
 
     @staticmethod
-    def _build_tag_row(path, node_id):
+    def _build_tag_row(path, node_id, node=None):
         segments = path.split('.')
+        namespace = ''
+        identifier = node_id
+        identifier_type = ''
+        if ';' in node_id:
+            left, right = node_id.split(';', 1)
+            namespace = left
+            identifier = right
+            identifier_type = right.split('=', 1)[0] if '=' in right else ''
+
+        data_type = ''
+        if node is not None:
+            try:
+                data_type = str(node.get_data_type_as_variant_type())
+            except Exception:
+                data_type = ''
+
         return {
             'tag_name': segments[-1] if segments else '',
             'node_id': node_id,
+            'path': path,
+            'namespace': namespace or '-',
+            'identifier': identifier or '-',
+            'identifier_type': identifier_type or '-',
+            'data_type': data_type or '-',
+            'node_class': 'Variable',
         }
 
     def fetch_tags(self, endpoint, max_tags=75, max_depth=4):
@@ -209,7 +243,7 @@ class OpcUaService:
                     and self._node_class_name(node) == 'Variable'
                     and self._is_custom_string_node(node_id, path)
                 ):
-                    tags.append(self._build_tag_row(path, node_id))
+                    tags.append(self._build_tag_row(path, node_id, node=node))
 
                 if depth >= max_depth:
                     continue
@@ -261,6 +295,151 @@ _logix_service = LogixService(pool=_logix_pool)
 _opcua_service = OpcUaService()
 _plc_history = SessionHistoryManager('plc_history', limit=10)
 _opcua_history = SessionHistoryManager('opcua_history', limit=10)
+_CACHE_DIR = Path(settings.BASE_DIR) / 'cache'
+_CONFIG_DIR = _CACHE_DIR / 'yaml'
+_LANDING_DATA_FILE = _CACHE_DIR / 'landing_data.json'
+_LANDING_BACKUP_DIR = _CACHE_DIR / 'backups'
+_RECENT_BACKUP_FILE = _LANDING_BACKUP_DIR / 'recent_backup.json'
+
+
+class LandingDataStore:
+    def __init__(self, data_path, backup_dir):
+        self.data_path = Path(data_path)
+        self.backup_dir = Path(backup_dir)
+        self._lock = threading.Lock()
+
+    def _timestamp(self):
+        return timezone.now().astimezone(timezone.get_current_timezone()).isoformat()
+
+    def default_payload(self):
+        return {
+            'updated_at': self._timestamp(),
+            'plc': {
+                'brand': 'allen_bradley',
+                'connection_path': '',
+                'last_tag': '',
+                'last_value': None,
+                'last_status': '',
+            },
+            'scada': {
+                'endpoint': '',
+                'last_fetch_status': '',
+                'discovered_tags': [],
+            },
+            'bridge': {
+                'mode': 'plc_to_scada',
+                'node_address_map': {},
+                'mapped_count': 0,
+                'synced_count': 0,
+                'last_sync_at': None,
+                'last_sync_result': '',
+                'last_sync_status_map': {},
+            },
+            'runtime': {
+                'last_action': 'initialized',
+                'last_message': 'Cache file created.',
+            },
+            'backup': {
+                'last_backup': None,
+                'reason': '',
+                'path': str(self.backup_dir.relative_to(settings.BASE_DIR)).replace('\\', '/') + '/',
+                'recent_file': str(_RECENT_BACKUP_FILE.relative_to(settings.BASE_DIR)).replace('\\', '/'),
+            },
+        }
+
+    def _read_unlocked(self):
+        if not self.data_path.exists():
+            return self.default_payload()
+        try:
+            with self.data_path.open('r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+        return self.default_payload()
+
+    def read(self):
+        with self._lock:
+            payload = self._read_unlocked()
+            self._write_unlocked(payload)
+            return payload
+
+    def _write_unlocked(self, payload):
+        payload['updated_at'] = self._timestamp()
+        self.data_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.data_path.open('w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=True)
+            handle.write('\n')
+
+    def update(self, mutate_callback, backup_reason=None):
+        with self._lock:
+            payload = self._read_unlocked()
+            mutate_callback(payload)
+            self._write_unlocked(payload)
+            if backup_reason:
+                self._create_backup_unlocked(payload, backup_reason)
+            return payload
+
+    def _create_backup_unlocked(self, payload, reason):
+        backup = payload.setdefault('backup', {})
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = timezone.now().astimezone(timezone.get_current_timezone()).strftime('%Y%m%d_%H%M%S')
+        backup_file = self.backup_dir / f'landing_data_{stamp}.json'
+        backup_payload = deepcopy(payload)
+        backup_payload['backup_snapshot'] = {
+            'reason': reason,
+            'created_at': self._timestamp(),
+            'source_file': self.data_path.name,
+        }
+        with backup_file.open('w', encoding='utf-8') as handle:
+            json.dump(backup_payload, handle, indent=2, ensure_ascii=True)
+            handle.write('\n')
+
+        with _RECENT_BACKUP_FILE.open('w', encoding='utf-8') as handle:
+            json.dump(backup_payload, handle, indent=2, ensure_ascii=True)
+            handle.write('\n')
+
+        payload['backup']['last_backup'] = self._timestamp()
+        payload['backup']['reason'] = reason
+
+    @staticmethod
+    def append_task(payload, action, message):
+        runtime = payload.setdefault('runtime', {})
+        runtime['last_action'] = action
+        runtime['last_message'] = message
+
+    def sync_from_session(self, request, action, message, backup_reason=None):
+        def mutate(payload):
+            plc_path = request.session.get('last_plc_ip', '')
+            payload['plc'] = {
+                'brand': request.session.get('last_plc_brand', 'allen_bradley'),
+                'connection_path': plc_path,
+                'last_tag': request.session.get('last_plc_tag', ''),
+                'last_value': request.session.get('landing_last_plc_value'),
+                'last_status': request.session.get('landing_last_plc_status', ''),
+            }
+            payload['scada'] = {
+                'endpoint': request.session.get('last_opcua_endpoint', ''),
+                'last_fetch_status': request.session.get('landing_last_opcua_status', ''),
+                'discovered_tags': request.session.get('opcua_last_tags', []),
+            }
+            payload['bridge'] = {
+                'mode': 'plc_to_scada',
+                'node_address_map': request.session.get('opcua_plc_address_map', {}),
+                'mapped_count': len(request.session.get('opcua_plc_address_map', {})),
+                'synced_count': request.session.get('landing_last_synced_count', 0),
+                'last_sync_at': request.session.get('landing_last_sync_at'),
+                'last_sync_result': request.session.get('landing_last_sync_result', ''),
+                'last_sync_status_map': request.session.get('opcua_sync_status_map', {}),
+            }
+            self.append_task(payload, action, message)
+
+        return self.update(mutate, backup_reason=backup_reason)
+
+
+_landing_store = LandingDataStore(_LANDING_DATA_FILE, _LANDING_BACKUP_DIR)
+_landing_store.read()
 
 
 class CombinedPageView(View):
@@ -322,35 +501,167 @@ class CombinedPageView(View):
         return value
 
     @staticmethod
-    def _build_common_rows(request, opcua_state):
+    def _build_common_rows(request):
         rows = []
+        if not request.session.get('opcua_last_tags', []):
+            return rows
         address_map = request.session.get('opcua_plc_address_map', {})
         status_map = request.session.get('opcua_sync_status_map', {})
 
-        if opcua_state.tag_name == 'Discovered tags' and isinstance(opcua_state.tag_value, list):
-            for item in opcua_state.tag_value:
-                node_id = item.get('node_id', '')
-                rows.append(
-                    {
-                        'node_id': node_id,
-                        'plc_address': address_map.get(node_id, ''),
-                        'status': status_map.get(node_id, ''),
-                    }
-                )
+        for node_id, plc_address in sorted(address_map.items()):
+            rows.append(
+                {
+                    'node_id': node_id,
+                    'plc_address': plc_address,
+                    'status': status_map.get(node_id, ''),
+                }
+            )
 
         return rows
 
-    def _build_context(self, request, plc_state, opcua_state, plc_form, opcua_form):
+    @staticmethod
+    def _ensure_config_dir():
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        return _CONFIG_DIR
+
+    @classmethod
+    def _config_file_choices(cls):
+        cfg_dir = cls._ensure_config_dir()
+        files = sorted(
+            [p.name for p in cfg_dir.iterdir() if p.is_file() and p.suffix.lower() in ('.yaml', '.yml')],
+            key=lambda name: name.lower(),
+        )
+        return [(name, name) for name in files]
+
+    @staticmethod
+    def _sanitize_config_stem(name):
+        stem = (name or '').strip()
+        if not stem:
+            return ''
+        stem = re.sub(r'\s+', '_', stem)
+        stem = re.sub(r'[^A-Za-z0-9_.\-]', '', stem)
+        stem = stem.strip('._-')
+        return stem
+
+    @classmethod
+    def _config_path_from_name(cls, name):
+        stem = cls._sanitize_config_stem(name)
+        if not stem:
+            return None
+        lowered = stem.lower()
+        if lowered.endswith('.yaml'):
+            filename = stem
+        elif lowered.endswith('.yml'):
+            filename = f'{stem[:-4]}.yaml'
+        else:
+            filename = f'{stem}.yaml'
+        return cls._ensure_config_dir() / filename
+
+    def _build_plc_config_payload(self, request):
+        last_plc_ip = request.session.get('last_plc_ip', '')
+        ip_address, slot = self._split_plc_path(last_plc_ip)
+        return {
+            'version': 1,
+            'saved_at': timezone.localtime().isoformat(),
+            'plc': {
+                'brand': request.session.get('last_plc_brand', 'allen_bradley'),
+                'ip_address': ip_address,
+                'slot': slot,
+                'tag': request.session.get('last_plc_tag', ''),
+            },
+            'opcua': {
+                'endpoint': request.session.get('last_opcua_endpoint', ''),
+            },
+            'mappings': {
+                'node_address_map': request.session.get('opcua_plc_address_map', {}),
+            },
+        }
+
+    @classmethod
+    def _apply_plc_config_payload(cls, request, payload):
+        if not isinstance(payload, dict):
+            raise ValueError('Invalid YAML format.')
+        plc = payload.get('plc') or {}
+        opcua = payload.get('opcua') or {}
+        mappings = payload.get('mappings') or {}
+
+        ip_address = str(plc.get('ip_address', '') or '').strip()
+        slot_raw = plc.get('slot', 0)
+        try:
+            slot = int(slot_raw)
+        except Exception as exc:
+            raise ValueError('Invalid slot value in YAML.') from exc
+        if slot < 0:
+            slot = 0
+        brand = str(plc.get('brand', 'allen_bradley') or 'allen_bradley').strip().lower()
+        if brand not in {'allen_bradley', 'siemens', 'modbus'}:
+            brand = 'allen_bradley'
+        tag = str(plc.get('tag', '') or '').strip()
+
+        opcua_endpoint = str(opcua.get('endpoint', '') or '').strip()
+        node_address_map = mappings.get('node_address_map') or {}
+        if not isinstance(node_address_map, dict):
+            raise ValueError('node_address_map must be a key-value object.')
+        cleaned_map = {}
+        for key, value in node_address_map.items():
+            node_id = str(key or '').strip()
+            plc_address = str(value or '').strip()
+            if node_id:
+                cleaned_map[node_id] = plc_address
+
+        if ip_address:
+            request.session['last_plc_ip'] = f'{ip_address}/{slot}'
+        else:
+            request.session['last_plc_ip'] = ''
+        request.session['last_plc_brand'] = brand
+        request.session['last_plc_tag'] = tag
+        request.session['last_opcua_endpoint'] = opcua_endpoint
+        request.session['opcua_plc_address_map'] = cleaned_map
+        request.session['opcua_sync_status_map'] = {}
+
+    @staticmethod
+    def _clear_plc_config_session(request):
+        request.session['last_plc_ip'] = ''
+        request.session['last_plc_brand'] = 'allen_bradley'
+        request.session['last_plc_tag'] = ''
+        request.session['last_opcua_endpoint'] = ''
+        request.session['opcua_plc_address_map'] = {}
+        request.session['opcua_sync_status_map'] = {}
+
+    def _build_context(
+        self,
+        request,
+        plc_state,
+        opcua_state,
+        plc_form,
+        opcua_form,
+        plc_config_save_form=None,
+        plc_config_load_form=None,
+        plc_config_import_form=None,
+        show_tag_popup=False,
+    ):
         plc_state.history = _plc_history.get(request.session)
         opcua_state.history = _opcua_history.get(request.session)
-        has_opcua_tags = bool(request.session.get('opcua_fetch_ready', False))
+        has_discovered_tags = bool(request.session.get('opcua_last_tags', []))
+        has_opcua_tags = bool(request.session.get('opcua_plc_address_map', {})) and has_discovered_tags
+        plc_config_save_form = plc_config_save_form or PlcConfigSaveForm()
+        plc_config_load_form = plc_config_load_form or PlcConfigLoadForm(file_choices=self._config_file_choices())
+        plc_config_import_form = plc_config_import_form or PlcConfigImportForm()
         return {
             'plc_state': plc_state,
             'opcua_state': opcua_state,
             'plc_form': plc_form,
             'opcua_form': opcua_form,
-            'common_rows': self._build_common_rows(request, opcua_state),
+            'plc_config_save_form': plc_config_save_form,
+            'plc_config_load_form': plc_config_load_form,
+            'plc_config_import_form': plc_config_import_form,
+            'common_rows': self._build_common_rows(request),
             'has_opcua_tags': has_opcua_tags,
+            'has_discovered_tags': has_discovered_tags,
+            'show_tag_popup': show_tag_popup and has_discovered_tags,
+            'landing_data_file': _LANDING_DATA_FILE.name,
+            'landing_backup_dir': str(_LANDING_BACKUP_DIR.relative_to(settings.BASE_DIR)).replace('\\', '/'),
+            'landing_recent_backup_file': str(_RECENT_BACKUP_FILE.relative_to(settings.BASE_DIR)).replace('\\', '/'),
         }
 
     @staticmethod
@@ -371,6 +682,7 @@ class CombinedPageView(View):
                 'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
                 'plc_ip_address': ip_address,
                 'plc_slot': slot,
+                'plc_tag': request.session.get('last_plc_tag', ''),
             }
         )
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
@@ -381,6 +693,7 @@ class CombinedPageView(View):
 
     def post(self, request):
         action = request.POST.get('action', '').strip().lower()
+        show_tag_popup = False
         plc_state = ViewState()
         opcua_state = self._cached_opcua_state(request.session)
         last_plc_ip = request.session.get('last_plc_ip', '')
@@ -390,10 +703,14 @@ class CombinedPageView(View):
                 'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
                 'plc_ip_address': ip_address,
                 'plc_slot': slot,
+                'plc_tag': request.session.get('last_plc_tag', ''),
             }
         )
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
+        plc_config_save_form = PlcConfigSaveForm()
+        plc_config_load_form = PlcConfigLoadForm(file_choices=self._config_file_choices())
+        plc_config_import_form = PlcConfigImportForm()
 
         if action == 'plc_read':
             plc_form = PlcReadForm(request.POST)
@@ -404,6 +721,7 @@ class CombinedPageView(View):
                 plc_state, display_path = _logix_service.connect_and_read(plc_ip, plc_tag)
                 request.session['last_plc_ip'] = plc_ip
                 request.session['last_plc_brand'] = plc_brand
+                request.session['last_plc_tag'] = plc_tag
                 _plc_history.add(
                     request.session,
                     {
@@ -418,6 +736,13 @@ class CombinedPageView(View):
                     messages.success(request, plc_state.message)
                 else:
                     messages.error(request, plc_state.message)
+                request.session['landing_last_plc_value'] = plc_state.tag_value
+                request.session['landing_last_plc_status'] = plc_state.tag_status
+                _landing_store.sync_from_session(
+                    request,
+                    action='plc_read',
+                    message=plc_state.message,
+                )
             else:
                 messages.error(request, 'Please correct the PLC input errors and try again.')
 
@@ -431,10 +756,7 @@ class CombinedPageView(View):
                     request.session['opcua_last_tags'] = opcua_state.tag_value
                     request.session['opcua_last_endpoint'] = opcua_state.connection_path or raw_endpoint
                     request.session['opcua_sync_status_map'] = {}
-                    request.session['opcua_plc_address_map'] = {}
-                    request.session['opcua_fetch_ready'] = bool(opcua_state.tag_value)
-                else:
-                    request.session['opcua_fetch_ready'] = False
+                    show_tag_popup = True
                 _opcua_history.add(
                     request.session,
                     {
@@ -449,9 +771,36 @@ class CombinedPageView(View):
                     messages.success(request, opcua_state.message)
                 else:
                     messages.error(request, opcua_state.message)
+                request.session['landing_last_opcua_status'] = opcua_state.tag_status
+                _landing_store.sync_from_session(
+                    request,
+                    action='opcua_fetch',
+                    message=opcua_state.message,
+                )
             else:
-                request.session['opcua_fetch_ready'] = False
                 messages.error(request, 'Please correct the OPC UA input errors and try again.')
+
+        elif action == 'add_selected_tags':
+            selected_node_ids = request.POST.getlist('selected_node_ids')
+            address_map = request.session.get('opcua_plc_address_map', {})
+            status_map = request.session.get('opcua_sync_status_map', {})
+            added_count = 0
+            for node_id in selected_node_ids:
+                if node_id not in address_map:
+                    address_map[node_id] = ''
+                    status_map[node_id] = ''
+                    added_count += 1
+            request.session['opcua_plc_address_map'] = address_map
+            request.session['opcua_sync_status_map'] = status_map
+            if added_count > 0:
+                messages.success(request, f'Added {added_count} tags to mapping.')
+            else:
+                messages.info(request, 'No new tags added (already in mapping).')
+            _landing_store.sync_from_session(
+                request,
+                action='add_selected_tags',
+                message=f'Added {added_count} OPC UA tags to PLC/SCADA mapping.',
+            )
 
         elif action == 'sync_opcua_to_plc':
             endpoint = request.session.get('opcua_last_endpoint', '').strip()
@@ -526,10 +875,18 @@ class CombinedPageView(View):
                             )
                         else:
                             messages.error(request, 'Connect completed with no successful tag sync operations.')
+                        request.session['landing_last_synced_count'] = success_count
+                        request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
+                        request.session['landing_last_sync_result'] = (
+                            f'Sync completed for {success_count} of {len(pairs)} mapped tags.'
+                        )
                     except Exception as exc:
                         for node_id, _ in pairs:
                             status_map[node_id] = f'Connection error: {exc}'
                         messages.error(request, f'Connect failed: {exc}')
+                        request.session['landing_last_synced_count'] = 0
+                        request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
+                        request.session['landing_last_sync_result'] = f'Connect failed: {exc}'
                     finally:
                         try:
                             opcua_client.disconnect()
@@ -537,10 +894,143 @@ class CombinedPageView(View):
                             pass
 
             request.session['opcua_sync_status_map'] = status_map
+            _landing_store.sync_from_session(
+                request,
+                action='sync_opcua_to_plc',
+                message=request.session.get('landing_last_sync_result', 'Sync attempt completed.'),
+                backup_reason='sync_opcua_to_plc',
+            )
 
         elif action == 'clear_table_addresses':
             request.session['opcua_plc_address_map'] = {}
             messages.info(request, 'All table address inputs have been cleared.')
+            _landing_store.sync_from_session(
+                request,
+                action='clear_table_addresses',
+                message='All PLC address mappings were cleared.',
+            )
+
+        elif action == 'save_plc_config':
+            plc_config_save_form = PlcConfigSaveForm(request.POST)
+            if plc_config_save_form.is_valid():
+                config_name = plc_config_save_form.cleaned_data['config_name']
+                config_path = self._config_path_from_name(config_name)
+                if config_path is None:
+                    messages.error(request, 'Invalid configuration name.')
+                else:
+                    payload = self._build_plc_config_payload(request)
+                    try:
+                        with config_path.open('w', encoding='utf-8') as handle:
+                            yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=False)
+                        messages.success(request, f'Configuration saved: {config_path.name}')
+                        plc_config_save_form = PlcConfigSaveForm()
+                        plc_config_load_form = PlcConfigLoadForm(file_choices=self._config_file_choices())
+                        _landing_store.sync_from_session(
+                            request,
+                            action='save_plc_config',
+                            message=f'Configuration saved to YAML: {config_path.name}',
+                            backup_reason='save_plc_config',
+                        )
+                    except Exception as exc:
+                        messages.error(request, f'Unable to save YAML file: {exc}')
+
+        elif action == 'load_plc_config':
+            plc_config_load_form = PlcConfigLoadForm(request.POST, file_choices=self._config_file_choices())
+            if plc_config_load_form.is_valid():
+                selected_file = plc_config_load_form.cleaned_data['config_file']
+                config_path = self._config_path_from_name(selected_file)
+                if config_path is None or not config_path.exists():
+                    messages.error(request, 'Selected configuration file was not found.')
+                else:
+                    try:
+                        with config_path.open('r', encoding='utf-8') as handle:
+                            payload = yaml.safe_load(handle) or {}
+                        self._apply_plc_config_payload(request, payload)
+                        messages.success(request, f'Configuration loaded: {config_path.name}')
+                        last_plc_ip = request.session.get('last_plc_ip', '')
+                        ip_address, slot = self._split_plc_path(last_plc_ip)
+                        plc_form = PlcReadForm(
+                            initial={
+                                'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
+                                'plc_ip_address': ip_address,
+                                'plc_slot': slot,
+                                'plc_tag': request.session.get('last_plc_tag', ''),
+                            }
+                        )
+                        opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
+                        opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
+                        _landing_store.sync_from_session(
+                            request,
+                            action='load_plc_config',
+                            message=f'Configuration loaded from YAML: {config_path.name}',
+                        )
+                    except Exception as exc:
+                        messages.error(request, f'Unable to load YAML file: {exc}')
+
+        elif action == 'import_plc_config':
+            plc_config_import_form = PlcConfigImportForm(request.POST, request.FILES)
+            if plc_config_import_form.is_valid():
+                file_obj = plc_config_import_form.cleaned_data['config_upload']
+                suggested_name = (getattr(file_obj, 'name', '') or '').rsplit('.', 1)[0]
+                config_path = self._config_path_from_name(suggested_name)
+                if config_path is None:
+                    messages.error(request, 'Invalid import file name.')
+                else:
+                    try:
+                        raw_data = file_obj.read().decode('utf-8')
+                        payload = yaml.safe_load(raw_data) or {}
+                        self._apply_plc_config_payload(request, payload)
+                        with config_path.open('w', encoding='utf-8') as handle:
+                            yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=False)
+                        messages.success(request, f'Configuration imported and loaded: {config_path.name}')
+                        plc_config_import_form = PlcConfigImportForm()
+                        plc_config_load_form = PlcConfigLoadForm(file_choices=self._config_file_choices())
+                        last_plc_ip = request.session.get('last_plc_ip', '')
+                        ip_address, slot = self._split_plc_path(last_plc_ip)
+                        plc_form = PlcReadForm(
+                            initial={
+                                'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
+                                'plc_ip_address': ip_address,
+                                'plc_slot': slot,
+                                'plc_tag': request.session.get('last_plc_tag', ''),
+                            }
+                        )
+                        opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
+                        opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
+                        _landing_store.sync_from_session(
+                            request,
+                            action='import_plc_config',
+                            message=f'Configuration imported from YAML: {config_path.name}',
+                            backup_reason='import_plc_config',
+                        )
+                    except UnicodeDecodeError:
+                        messages.error(request, 'Import failed: file must be UTF-8 encoded text.')
+                    except Exception as exc:
+                        messages.error(request, f'Import failed: {exc}')
+
+        elif action == 'clear_plc_config':
+            self._clear_plc_config_session(request)
+            messages.info(request, 'PLC configuration values have been cleared from the current session.')
+            plc_form = PlcReadForm(
+                initial={
+                    'plc_brand': 'allen_bradley',
+                    'plc_ip_address': '',
+                    'plc_slot': 0,
+                    'plc_tag': '',
+                }
+            )
+            opcua_form = OpcUaFetchForm(initial={'opcua_host': '', 'opcua_port': 4840})
+            request.session['landing_last_plc_value'] = None
+            request.session['landing_last_plc_status'] = ''
+            request.session['landing_last_opcua_status'] = ''
+            request.session['landing_last_synced_count'] = 0
+            request.session['landing_last_sync_at'] = None
+            request.session['landing_last_sync_result'] = ''
+            _landing_store.sync_from_session(
+                request,
+                action='clear_plc_config',
+                message='Current PLC/SCADA session values were cleared.',
+            )
 
         elif action == 'clear_history':
             clear_form = ClearHistoryForm(request.POST)
@@ -557,4 +1047,18 @@ class CombinedPageView(View):
         else:
             messages.error(request, 'Unsupported action requested.')
 
-        return render(request, self.template_name, self._build_context(request, plc_state, opcua_state, plc_form, opcua_form))
+        return render(
+            request,
+            self.template_name,
+            self._build_context(
+                request,
+                plc_state,
+                opcua_state,
+                plc_form,
+                opcua_form,
+                plc_config_save_form=plc_config_save_form,
+                plc_config_load_form=plc_config_load_form,
+                plc_config_import_form=plc_config_import_form,
+                show_tag_popup=show_tag_popup,
+            ),
+        )

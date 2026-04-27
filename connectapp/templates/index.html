@@ -3,10 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Industrial Connectivity Studio</title>
+  <title>Click2Connect</title>
   <style>
     :root{
-      --bg:#edf3f8;
       --panel:#ffffff;
       --soft:#f7fbff;
       --line:#d5e0ea;
@@ -20,10 +19,10 @@
       --ok-bg:#e9f9f3;
       --bad:#b43d49;
       --bad-bg:#fdeff1;
-      --chip:#e6f1f6;
       --radius:16px;
       --shadow:0 20px 50px rgba(10,33,50,.12);
       --card-shadow:0 10px 24px rgba(16,40,58,.08);
+      --card-shadow-hover:0 16px 34px rgba(16,40,58,.16);
     }
 
     *{box-sizing:border-box}
@@ -40,7 +39,7 @@
     }
 
     .app{
-      max-width:1260px;
+      max-width:1320px;
       margin:0 auto;
       background:var(--panel);
       border:1px solid var(--line);
@@ -51,7 +50,7 @@
 
     .head{
       position:relative;
-      padding:24px 28px 26px;
+      padding:28px 30px 30px;
       border-bottom:1px solid var(--line);
       background:
         linear-gradient(135deg, #fafdff 0%, #edf6fd 54%, #eaf7f2 100%);
@@ -89,30 +88,56 @@
       letter-spacing:.01em;
     }
 
-    .sub{margin:0;color:var(--muted);max-width:880px}
+    .sub{margin:0;color:var(--muted);max-width:880px;line-height:1.55}
 
     .grid{
       display:grid;
-      gap:16px;
-      padding:18px;
+      gap:20px;
+      padding:20px;
       grid-template-columns:1fr 1fr;
     }
 
     .card{
-      background:linear-gradient(180deg, #fcfeff 0%, #f7fbfe 100%);
-      border:1px solid var(--line);
+      background:linear-gradient(180deg, #fcfeff 0%, #f5fafe 100%);
+      border:1px solid #ccdae6;
       border-radius:var(--radius);
-      padding:16px;
+      padding:18px;
       box-shadow:var(--card-shadow);
       transition:transform .2s ease, box-shadow .2s ease;
     }
 
     .card:hover{
       transform:translateY(-2px);
-      box-shadow:0 14px 26px rgba(16,40,58,.12);
+      box-shadow:var(--card-shadow-hover);
     }
 
-    h2{margin:0 0 11px;font-size:1.03rem;letter-spacing:.01em}
+    .card-title{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      margin-bottom:14px;
+    }
+
+    .title-chip{
+      display:inline-block;
+      padding:3px 8px;
+      border-radius:999px;
+      font-size:.68rem;
+      font-weight:800;
+      letter-spacing:.05em;
+      text-transform:uppercase;
+      border:1px solid transparent;
+    }
+
+    .card--plc{border-top:4px solid #1f7b96}
+    .card--opcua{border-top:4px solid #2f8a6e}
+    .card--map{border-top:4px solid #5a6f87}
+
+    .card--plc .title-chip{background:#e8f5fb;color:#1a6380;border-color:#bdddef}
+    .card--opcua .title-chip{background:#eaf8f1;color:#2b715d;border-color:#c6e9d8}
+    .card--map .title-chip{background:#eff3f8;color:#4e6278;border-color:#d3dce7}
+
+    h2{margin:0;font-size:1.03rem;letter-spacing:.01em;color:#0e4258}
 
     label{
       display:block;
@@ -125,11 +150,15 @@
     input,select{
       width:100%;
       padding:11px 12px;
-      border:1px solid var(--line-strong);
+      border:1px solid #b8cbd9;
       border-radius:11px;
-      background:#fff;
+      background:#fcfeff;
       color:var(--ink);
       transition:border-color .15s ease, box-shadow .15s ease;
+    }
+
+    input::placeholder{
+      color:#88a0b3;
     }
 
     input:focus,select:focus{
@@ -160,10 +189,238 @@
       min-width:0;
     }
 
+    .tag-selection{
+      max-height:300px;
+      overflow-y:auto;
+      border:1px solid var(--line);
+      border-radius:11px;
+      padding:10px;
+      background:var(--soft);
+    }
+
+    .tag-item{
+      margin-bottom:8px;
+      border:1px solid #d5e2ed;
+      border-radius:10px;
+      background:#fff;
+      padding:10px 12px;
+    }
+
+    .tag-item-head{
+      display:grid;
+      grid-template-columns:auto 1fr auto;
+      gap:10px;
+      align-items:start;
+    }
+
+    .tag-select{
+      margin-top:3px;
+    }
+
+    .tag-main-wrap{
+      min-width:0;
+    }
+
+    .tag-main{
+      display:block;
+      font-weight:700;
+      color:#123d53;
+      font-size:.9rem;
+      line-height:1.35;
+    }
+
+    .tag-node{
+      grid-column:2;
+      display:inline-block;
+      color:#3f5f74;
+      background:#f4f8fc;
+      border:1px solid #d6e2ec;
+      border-radius:7px;
+      padding:3px 6px;
+      font-size:.76rem;
+      width:max-content;
+      max-width:100%;
+      overflow-wrap:anywhere;
+      margin-top:5px;
+    }
+
+    .tag-toggle{
+      min-width:118px;
+      white-space:nowrap;
+    }
+
+    .tag-details{
+      display:none;
+      margin-top:10px;
+      padding-top:10px;
+      border-top:1px solid #dce6ee;
+    }
+
+    .tag-item.is-open .tag-details{
+      display:block;
+    }
+
+    .tag-meta{
+      display:grid;
+      grid-template-columns:repeat(2, minmax(0, 1fr));
+      gap:8px;
+    }
+
+    .tag-meta-card{
+      border:1px solid #dbe6ee;
+      border-radius:9px;
+      background:#f8fbfe;
+      padding:8px 9px;
+      min-width:0;
+    }
+
+    .tag-meta-card b{
+      display:block;
+      margin-bottom:4px;
+      color:#547083;
+      font-size:.73rem;
+      text-transform:uppercase;
+      letter-spacing:.04em;
+    }
+
+    .tag-meta-card span,
+    .tag-meta-card code{
+      display:block;
+      color:#133c50;
+      font-size:.82rem;
+      line-height:1.45;
+      overflow-wrap:anywhere;
+    }
+
+    .tag-item input[type="checkbox"]{
+      margin-top:2px;
+      width:16px;
+      height:16px;
+      accent-color:#136983;
+    }
+
+    .flow-guide{
+      margin-top:12px;
+      border:1px solid #cce0ec;
+      border-radius:11px;
+      background:linear-gradient(180deg,#f6fbff 0%,#eef7fd 100%);
+      padding:10px 12px;
+    }
+
+    .flow-guide.waiting{
+      border-color:#d6e1ea;
+      background:linear-gradient(180deg,#f8fbfe 0%,#f1f6fb 100%);
+    }
+
+    .flow-guide p{
+      margin:0;
+      font-size:.84rem;
+      color:#335a71;
+      line-height:1.45;
+    }
+
+    .browse-cta{
+      position:relative;
+      font-weight:800;
+      border-width:2px;
+    }
+
+    .browse-cta.ready{
+      color:#0b4e67;
+      border-color:#0e6f91;
+      background:linear-gradient(180deg,#e8f8ff 0%,#d8f1fb 100%);
+      box-shadow:0 0 0 3px rgba(16,111,145,.13);
+      animation:browsePulse 1.6s ease-in-out infinite;
+    }
+
+    .flow-ok{
+      color:#0d617f;
+      font-weight:700;
+      margin-top:7px;
+    }
+
+    .popup-sub{
+      margin:0 0 10px;
+      color:#49697e;
+      font-size:.86rem;
+      line-height:1.45;
+    }
+
+    .popup-actions{
+      margin:0 0 10px;
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+
+    .popup-actions .hint{
+      margin:0;
+    }
+
+    @keyframes browsePulse{
+      0%{box-shadow:0 0 0 0 rgba(16,111,145,.22)}
+      70%{box-shadow:0 0 0 8px rgba(16,111,145,0)}
+      100%{box-shadow:0 0 0 0 rgba(16,111,145,0)}
+    }
+
+    .popup-backdrop{
+      position:fixed;
+      inset:0;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:16px;
+      background:rgba(12,35,52,.46);
+      z-index:50;
+    }
+
+    .popup-backdrop.is-open{
+      display:flex;
+    }
+
+    .popup{
+      width:min(860px, 100%);
+      max-height:88vh;
+      overflow:auto;
+      border:1px solid var(--line-strong);
+      border-radius:14px;
+      background:#fff;
+      box-shadow:0 20px 42px rgba(12,35,52,.24);
+      padding:14px;
+    }
+
+    .popup-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:10px;
+    }
+
+    .popup-head h3{
+      margin:0;
+      font-size:1rem;
+      color:#0d4960;
+    }
+
+    .btn.ghost{
+      background:#fff;
+      color:#375a70;
+      border:1px solid #c8d8e5;
+      width:auto;
+      margin-top:0;
+      box-shadow:none;
+    }
+
     .btn{
       border:0;
       border-radius:11px;
       padding:10px 12px;
+      min-height:42px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
       font-weight:700;
       cursor:pointer;
       transition:transform .08s ease, filter .15s ease;
@@ -185,7 +442,6 @@
       color:#9d3641;
       border:1px solid #efcad0;
       font-size:.82rem;
-      padding:9px 12px;
     }
     .btn:disabled{
       cursor:not-allowed;
@@ -196,7 +452,11 @@
     .disabled-note{
       margin-top:8px;
       font-size:.8rem;
-      color:#6b7e90;
+      color:#5e7488;
+      border:1px dashed #c8d7e3;
+      background:#f7fbff;
+      border-radius:10px;
+      padding:8px 10px;
     }
 
     .action-row{
@@ -213,6 +473,95 @@
       min-width:220px;
     }
 
+    .config-top{
+      margin:0 18px;
+      border:1px solid #c8d8e4;
+      border-radius:14px;
+      background:linear-gradient(180deg,#f9fcff 0%,#f1f7fc 100%);
+      box-shadow:0 8px 22px rgba(15,52,74,.08);
+      padding:14px;
+    }
+
+    .config-top-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:10px;
+    }
+
+    .config-top-head h2{
+      margin:0;
+      font-size:.96rem;
+      color:#0e4b60;
+    }
+
+    .config-top-head p{
+      margin:0;
+      color:#4c677b;
+      font-size:.8rem;
+    }
+
+    .config-actions{
+      display:grid;
+      grid-template-columns:repeat(4, minmax(200px, 1fr));
+      gap:10px;
+    }
+
+    .config-card{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      padding:12px;
+      border:1px solid #d3e0ea;
+      border-radius:12px;
+      background:#fff;
+      min-height:150px;
+      transition:border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+    }
+
+    .config-card:hover{
+      border-color:#b8cfde;
+      box-shadow:0 8px 18px rgba(14,54,78,.08);
+      transform:translateY(-1px);
+    }
+
+    .config-card h3{
+      margin:0;
+      font-size:.88rem;
+      color:#1b4f68;
+      font-weight:700;
+    }
+
+    .config-card p{
+      margin-top:0;
+      margin-bottom:0;
+      color:#597084;
+      font-size:.78rem;
+      line-height:1.4;
+    }
+
+    .config-card label{
+      margin:2px 0 4px;
+      font-size:.78rem;
+      color:#4a6276;
+      font-weight:700;
+    }
+
+    .config-card .btn{
+      margin-top:auto;
+      width:100%;
+      min-width:0;
+    }
+
+    .config-card .btn.primary{
+      margin-top:auto;
+    }
+
+    .config-card .btn.warn{
+      min-width:0;
+    }
+
     .hint{margin:8px 0 0;color:var(--muted);font-size:.82rem}
     .hint .strong{font-weight:700;color:#355267}
 
@@ -221,18 +570,19 @@
       padding:10px 12px;
       border-radius:11px;
       border:1px solid var(--line);
-      background:#eef5fb;
+      background:#edf5fc;
       font-weight:600;
     }
 
     .status.ok{background:var(--ok-bg);border-color:#b9e8d5;color:var(--ok)}
     .status.bad{background:var(--bad-bg);border-color:#f2c3c9;color:var(--bad)}
-    .alerts{padding:0 18px 4px}
+    .alerts{padding:0 18px 6px}
     .alert{margin-top:12px;padding:10px 12px;border-radius:11px;border:1px solid var(--line);font-weight:600}
     .alert.success{background:var(--ok-bg);border-color:#b9e8d5;color:var(--ok)}
     .alert.error{background:var(--bad-bg);border-color:#f2c3c9;color:var(--bad)}
     .alert.info{background:#eef5fb;border-color:#c6d9e8;color:#1f5678}
     .field-error{margin:6px 0 0;color:#b43d49;font-size:.82rem;font-weight:600}
+    .history-clear-form{margin:0 0 8px}
 
     .kv{display:grid;gap:8px;margin-top:11px}
 
@@ -251,12 +601,11 @@
     .k b{color:var(--muted);font-size:.84rem;font-weight:700}
     .k span{font-weight:700;overflow-wrap:anywhere;text-align:right;font-size:.9rem}
 
-    .header-row{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:12px}
     .history-panel{
       margin-top:12px;
       border:1px solid var(--line);
       border-radius:12px;
-      background:#fbfdff;
+      background:#f8fcff;
       overflow:hidden;
     }
 
@@ -266,7 +615,7 @@
       padding:11px 12px;
       font-weight:600;
       color:#496377;
-      background:#f6f9fc;
+      background:#f1f7fc;
       border-bottom:1px solid var(--line);
     }
 
@@ -297,7 +646,7 @@
 
     .wide-card{
       grid-column:1/-1;
-      padding:18px;
+      padding:20px;
       background:linear-gradient(180deg,#fbfdff 0%,#f4f9fc 100%);
     }
 
@@ -319,7 +668,7 @@
       top:0;
       z-index:2;
       color:#0e4b60;
-      background:linear-gradient(180deg,#eef8fd 0%,#e3f0f8 100%);
+      background:linear-gradient(180deg,#e8f4fb 0%,#deedf7 100%);
       font-size:.8rem;
       letter-spacing:.02em;
       text-transform:uppercase;
@@ -328,7 +677,6 @@
     tbody tr:nth-child(odd){background:#fcfeff}
     tbody tr:hover{background:#eff7fc}
 
-    .mono{font-family:Consolas,"Courier New",monospace;font-size:.82rem}
     td.path-col,td.node-col,td.value-col{white-space:normal;overflow-wrap:anywhere;min-width:180px}
 
     .node-cell{
@@ -366,11 +714,19 @@
     @media (max-width:980px){
       body{padding:12px}
       .grid{grid-template-columns:1fr;padding:12px}
+      .config-top{margin:0 12px}
+      .config-actions{grid-template-columns:1fr 1fr}
       .head{padding:18px}
       .card{padding:13px}
       .wide-card{padding:14px}
       .plc-conn-row{grid-template-columns:1fr}
       .opcua-conn-row{grid-template-columns:2fr 1fr}
+      .tag-meta{grid-template-columns:1fr}
+    }
+    @media (max-width:700px){
+      .config-actions{grid-template-columns:1fr}
+      .tag-item-head{grid-template-columns:auto 1fr}
+      .tag-toggle{grid-column:2;justify-self:start}
     }
   </style>
 </head>
@@ -378,8 +734,7 @@
   <main class="app">
     <header class="head">
       <span class="badge">Operations Platform</span>
-      <h1>Industrial Connectivity Studio</h1>
-      <p class="sub">Professional workspace for PLC connectivity, OPC UA tag discovery, and controlled row-level data synchronization.</p>
+      <h1>Click2Connect</h1>
     </header>
     {% if messages %}
       <section class="alerts">
@@ -389,9 +744,129 @@
       </section>
     {% endif %}
 
+    <section class="config-top fade-up">
+      <div class="config-top-head">
+        <h2>Configuration Manager</h2>
+      </div>
+      <div class="config-actions">
+        <form method="POST" novalidate class="config-card">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="save_plc_config">
+          <h3>Save Configuration</h3>
+          <p>Create or update a YAML profile from current values.</p>
+          <label for="config_name">File Name</label>
+          {{ plc_config_save_form.config_name }}
+          {% for err in plc_config_save_form.config_name.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+          <button class="btn primary" type="submit">Save</button>
+        </form>
+
+        <form method="POST" novalidate class="config-card">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="load_plc_config">
+          <h3>Load Configuration</h3>
+          <p>Apply any saved YAML profile to the current session.</p>
+          <label for="config_file">Saved File</label>
+          {{ plc_config_load_form.config_file }}
+          {% for err in plc_config_load_form.config_file.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+          <button class="btn primary" type="submit">Load</button>
+        </form>
+
+        <form method="POST" enctype="multipart/form-data" novalidate class="config-card">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="import_plc_config">
+          <h3>Import Config File</h3>
+          <p>Upload an external YAML file and apply it instantly.</p>
+          <label for="id_config_upload">Upload File</label>
+          {{ plc_config_import_form.config_upload }}
+          {% for err in plc_config_import_form.config_upload.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+          <button class="btn primary" type="submit">Import</button>
+        </form>
+
+        <form method="POST" novalidate class="config-card">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="clear_plc_config">
+          <h3>Clear Current Session</h3>
+          <p>Reset form values only. Saved YAML files are not deleted.</p>
+          <button class="btn warn" type="submit">Clear Current Config</button>
+        </form>
+      </div>
+    </section>
+
     <section class="grid">
-      <section class="card fade-up">
-        <h2>PLC Tag Read</h2>
+      <section class="card card--opcua fade-up">
+        <div class="card-title">
+          <span class="title-chip">OPC UA</span>
+          <h2>OPC UA Tag Discovery</h2>
+        </div>
+        <form method="POST" novalidate>
+          {% csrf_token %}
+          <input type="hidden" name="action" value="opcua_fetch">
+
+          <div class="opcua-conn-row">
+            <div class="field">
+              <label for="opcua_host">OPC UA Host/IP</label>
+              {{ opcua_form.opcua_host }}
+              {% for err in opcua_form.opcua_host.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+            </div>
+            <div class="field">
+              <label for="opcua_port">Port</label>
+              {{ opcua_form.opcua_port }}
+              {% for err in opcua_form.opcua_port.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+            </div>
+          </div>
+          <p class="hint">Endpoint preview: <code id="opcua-endpoint-preview">-</code></p>
+
+          <button class="btn primary" type="submit">Connect and Fetch Tags</button>
+          <div class="action-row">
+            <button class="btn ghost browse-cta{% if has_discovered_tags %} ready{% endif %}" id="open-opcua-browser" type="button" {% if not has_discovered_tags %}disabled{% endif %}>
+              {% if has_discovered_tags %}Browse OPC UA Tags{% else %}Browse OPC UA Tags (Connect First){% endif %}
+            </button>
+          </div>
+          {% if has_discovered_tags %}
+            <p class="hint flow-ok">Browse is active now.</p>
+          {% else %}
+            <div class="flow-guide waiting">
+              <p><b>Connect required.</b> Click <b>Connect and Fetch Tags</b> first. Browse will unlock automatically after successful connection.</p>
+            </div>
+          {% endif %}
+        </form>
+
+        {% if opcua_state.message %}
+          <div class="status {% if 'Connected to OPC UA' in opcua_state.message or 'history cleared' in opcua_state.message|lower %}ok{% else %}bad{% endif %}">{{ opcua_state.message }}</div>
+        {% endif %}
+
+        <div class="kv">
+          {% if opcua_state.connection_path %}<div class="k"><b>Endpoint</b><span>{{ opcua_state.connection_path }}</span></div>{% endif %}
+          {% if opcua_state.tag_status %}<div class="k"><b>Status</b><span>{{ opcua_state.tag_status }}</span></div>{% endif %}
+        </div>
+
+        <details class="history-panel">
+          <summary>OPC UA History</summary>
+          <div class="history-content">
+            <form method="POST" class="history-clear-form">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="clear_history">
+              <input type="hidden" name="protocol" value="opcua">
+              <button class="btn warn" type="submit">Clear History</button>
+            </form>
+            {% if opcua_state.history %}
+              <ul class="history">
+                {% for item in opcua_state.history %}
+                  <li><time>{{ item.when }}</time><p><strong>{{ item.message }}</strong><br>{{ item.path }}</p></li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="hint">No OPC UA activity yet.</p>
+            {% endif %}
+          </div>
+        </details>
+      </section>
+
+      <section class="card card--plc fade-up">
+        <div class="card-title">
+          <span class="title-chip">PLC</span>
+          <h2>PLC Tag Read</h2>
+        </div>
         {% if not has_opcua_tags %}
           <p class="disabled-note">Enable by fetching OPC UA tags first.</p>
         {% endif %}
@@ -442,7 +917,7 @@
         <details class="history-panel">
           <summary>PLC History</summary>
           <div class="history-content">
-            <form method="POST" style="margin:0 0 8px">
+            <form method="POST" class="history-clear-form">
               {% csrf_token %}
               <input type="hidden" name="action" value="clear_history">
               <input type="hidden" name="protocol" value="plc">
@@ -461,65 +936,14 @@
         </details>
       </section>
 
-      <section class="card fade-up">
-        <h2>OPC UA Tag Discovery</h2>
-        <form method="POST" novalidate>
-          {% csrf_token %}
-          <input type="hidden" name="action" value="opcua_fetch">
-
-          <div class="opcua-conn-row">
-            <div class="field">
-              <label for="opcua_host">OPC UA Host/IP</label>
-              {{ opcua_form.opcua_host }}
-              {% for err in opcua_form.opcua_host.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-            </div>
-            <div class="field">
-              <label for="opcua_port">Port</label>
-              {{ opcua_form.opcua_port }}
-              {% for err in opcua_form.opcua_port.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-            </div>
-          </div>
-          <p class="hint">Endpoint preview: <code id="opcua-endpoint-preview">-</code></p>
-
-          <button class="btn primary" type="submit">Connect and Fetch Tags</button>
-        </form>
-
-        {% if opcua_state.message %}
-          <div class="status {% if 'Connected to OPC UA' in opcua_state.message or 'history cleared' in opcua_state.message|lower %}ok{% else %}bad{% endif %}">{{ opcua_state.message }}</div>
-        {% endif %}
-
-        <div class="kv">
-          {% if opcua_state.connection_path %}<div class="k"><b>Endpoint</b><span>{{ opcua_state.connection_path }}</span></div>{% endif %}
-          {% if opcua_state.tag_status %}<div class="k"><b>Status</b><span>{{ opcua_state.tag_status }}</span></div>{% endif %}
+      <section class="card card--map wide-card fade-up">
+        <div class="card-title">
+          <span class="title-chip">Mapping</span>
+          <h2>PLC Address to NodeID Mapping</h2>
         </div>
-
-        <details class="history-panel">
-          <summary>OPC UA History</summary>
-          <div class="history-content">
-            <form method="POST" style="margin:0 0 8px">
-              {% csrf_token %}
-              <input type="hidden" name="action" value="clear_history">
-              <input type="hidden" name="protocol" value="opcua">
-              <button class="btn warn" type="submit">Clear History</button>
-            </form>
-            {% if opcua_state.history %}
-              <ul class="history">
-                {% for item in opcua_state.history %}
-                  <li><time>{{ item.when }}</time><p><strong>{{ item.message }}</strong><br>{{ item.path }}</p></li>
-                {% endfor %}
-              </ul>
-            {% else %}
-              <p class="hint">No OPC UA activity yet.</p>
-            {% endif %}
-          </div>
-        </details>
-      </section>
-
-      <section class="card wide-card fade-up">
-        <h2>PLC Address to NodeID Mapping</h2>
         <p class="hint">Top PLC Read is for manual check. In this table, Connect reads each PLC Address value and writes it to the same-row NodeID.</p>
         {% if not has_opcua_tags %}
-          <p class="disabled-note">Fetch OPC UA tags to enable Address editing and Connect actions.</p>
+          <p class="disabled-note">Add tags to mapping to enable Address editing and Connect actions.</p>
         {% endif %}
         <form method="POST" novalidate>
           {% csrf_token %}
@@ -569,6 +993,71 @@
       </section>
     </section>
   </main>
+  {% if has_discovered_tags %}
+    <div class="popup-backdrop{% if show_tag_popup %} is-open{% endif %}" id="opcua-tag-popup">
+      <div class="popup">
+        <div class="popup-head">
+          <h3>Select OPC UA Tags to Map</h3>
+          <button type="button" class="btn ghost" id="close-opcua-browser">Close</button>
+        </div>
+        <p class="popup-sub">Choose one or more tags, then click <b>Add Selected Tags to Mapping</b>.</p>
+        <form method="POST" novalidate>
+          {% csrf_token %}
+          <input type="hidden" name="action" value="add_selected_tags">
+          <div class="popup-actions">
+            <button type="button" class="btn ghost" id="select-all-tags">Select All</button>
+            <button type="button" class="btn ghost" id="clear-all-tags">Clear Selection</button>
+            <p class="hint">Selected: <b id="selected-tag-count">0</b></p>
+          </div>
+          <div class="tag-selection">
+            {% for tag in opcua_state.tag_value %}
+            <div class="tag-item">
+              <div class="tag-item-head">
+                <input class="tag-select" type="checkbox" name="selected_node_ids" value="{{ tag.node_id }}">
+                <div class="tag-main-wrap">
+                  <span class="tag-main">{{ tag.tag_name }}</span>
+                  <code class="tag-node">{{ tag.node_id }}</code>
+                </div>
+                <button type="button" class="btn ghost tag-toggle" aria-expanded="false">Show Details</button>
+              </div>
+              <div class="tag-details">
+                <div class="tag-meta">
+                  <div class="tag-meta-card">
+                    <b>Node ID</b>
+                    <code>{{ tag.node_id }}</code>
+                  </div>
+                  <div class="tag-meta-card">
+                    <b>Data Type</b>
+                    <span>{{ tag.data_type|default:"-" }}</span>
+                  </div>
+                  <div class="tag-meta-card">
+                    <b>Browse Path</b>
+                    <span>{{ tag.path|default:"-" }}</span>
+                  </div>
+                  <div class="tag-meta-card">
+                    <b>Namespace</b>
+                    <span>{{ tag.namespace|default:"-" }}</span>
+                  </div>
+                  <div class="tag-meta-card">
+                    <b>Identifier</b>
+                    <span>{{ tag.identifier|default:"-" }}</span>
+                  </div>
+                  <div class="tag-meta-card">
+                    <b>Identifier Type</b>
+                    <span>{{ tag.identifier_type|default:"-" }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="action-row">
+            <button type="submit" class="btn primary">Add Selected Tags to Mapping</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  {% endif %}
 <script>
   (function() {
     var brand = document.getElementById('plc_brand');
@@ -579,6 +1068,12 @@
     var opcuaHost = document.getElementById('opcua_host');
     var opcuaPort = document.getElementById('opcua_port');
     var opcuaPreview = document.getElementById('opcua-endpoint-preview');
+    var popup = document.getElementById('opcua-tag-popup');
+    var openBrowser = document.getElementById('open-opcua-browser');
+    var closeBrowser = document.getElementById('close-opcua-browser');
+    var selectAllBtn = document.getElementById('select-all-tags');
+    var clearAllBtn = document.getElementById('clear-all-tags');
+    var selectedCount = document.getElementById('selected-tag-count');
 
     if (!brand || !ip || !slot || !slotWrap || !preview || !opcuaHost || !opcuaPort || !opcuaPreview) return;
 
@@ -605,8 +1100,64 @@
     slot.addEventListener('input', updatePlcUi);
     opcuaHost.addEventListener('input', updateOpcuaUi);
     opcuaPort.addEventListener('input', updateOpcuaUi);
+
+    if (popup && openBrowser && closeBrowser) {
+      openBrowser.addEventListener('click', function() {
+        popup.classList.add('is-open');
+      });
+      closeBrowser.addEventListener('click', function() {
+        popup.classList.remove('is-open');
+      });
+      popup.addEventListener('click', function(evt) {
+        if (evt.target === popup) popup.classList.remove('is-open');
+      });
+    }
+
+    function selectedTagCheckboxes() {
+      return popup ? popup.querySelectorAll('input[name=\"selected_node_ids\"]') : [];
+    }
+
+    function updateSelectedCount() {
+      if (!selectedCount) return;
+      var all = selectedTagCheckboxes();
+      var count = 0;
+      all.forEach(function(el) { if (el.checked) count += 1; });
+      selectedCount.textContent = String(count);
+    }
+
+    if (popup) {
+      popup.querySelectorAll('.tag-toggle').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var item = btn.closest('.tag-item');
+          if (!item) return;
+          var isOpen = item.classList.toggle('is-open');
+          btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+          btn.textContent = isOpen ? 'Hide Details' : 'Show Details';
+        });
+      });
+
+      popup.addEventListener('change', function(evt) {
+        if (evt.target && evt.target.name === 'selected_node_ids') updateSelectedCount();
+      });
+    }
+
+    if (selectAllBtn) {
+      selectAllBtn.addEventListener('click', function() {
+        selectedTagCheckboxes().forEach(function(el) { el.checked = true; });
+        updateSelectedCount();
+      });
+    }
+
+    if (clearAllBtn) {
+      clearAllBtn.addEventListener('click', function() {
+        selectedTagCheckboxes().forEach(function(el) { el.checked = false; });
+        updateSelectedCount();
+      });
+    }
+
     updatePlcUi();
     updateOpcuaUi();
+    updateSelectedCount();
   })();
 </script>
 </body>
