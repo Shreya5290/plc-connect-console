@@ -13,8 +13,8 @@ class PlcReadForm(forms.Form):
         label='PLC Brand',
         choices=(
             ('allen_bradley', 'Allen-Bradley'),
-            ('siemens', 'Siemens'),
-            ('modbus', 'Modbus'),
+            ('siemens_snap7', 'Siemens (Snap7)'),
+            ('pymodbus', 'Modbus'),
         ),
         required=True,
         initial='allen_bradley',
@@ -46,6 +46,78 @@ class PlcReadForm(forms.Form):
             }
         ),
     )
+
+    siemens_operation = forms.ChoiceField(
+        label='Operation',
+        choices=(('read', 'Read'), ('write', 'Write')),
+        required=False,
+        initial='read',
+        widget=forms.Select(attrs={'id': 'siemens_operation'}),
+    )
+    siemens_write_value = forms.CharField(
+        label='Write Value',
+        max_length=120,
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                'id': 'siemens_write_value',
+                'placeholder': 'Value to write',
+                'autocomplete': 'off',
+            }
+        ),
+    )
+    plc_port = forms.IntegerField(
+        label='Port',
+        required=False,
+        min_value=1,
+        max_value=65535,
+        widget=forms.NumberInput(attrs={'id': 'plc_port', 'placeholder': 'Port', 'autocomplete': 'off'}),
+    )
+    modbus_function = forms.ChoiceField(
+        label='Function',
+        choices=(
+            ('holding', 'Holding Register'),
+            ('input_register', 'Input Register'),
+            ('coil', 'Coil'),
+            ('discrete_input', 'Discrete Input'),
+        ),
+        required=False,
+        initial='holding',
+        widget=forms.Select(attrs={'id': 'modbus_function'}),
+    )
+    modbus_operation = forms.ChoiceField(
+        label='Operation',
+        choices=(('read', 'Read'), ('write', 'Write')),
+        required=False,
+        initial='read',
+        widget=forms.Select(attrs={'id': 'modbus_operation'}),
+    )
+    modbus_data_type = forms.ChoiceField(
+        label='Data Type',
+        choices=(
+            ('uint16', 'UInt16'),
+            ('int16', 'Int16'),
+            ('uint32', 'UInt32'),
+            ('int32', 'Int32'),
+            ('float32', 'Float32'),
+            ('bool', 'Boolean'),
+        ),
+        required=False,
+        initial='uint16',
+        widget=forms.Select(attrs={'id': 'modbus_data_type'}),
+    )
+    modbus_write_value = forms.CharField(
+        label='Write Value',
+        max_length=120,
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                'id': 'modbus_write_value',
+                'placeholder': 'Value to write',
+                'autocomplete': 'off',
+            }
+        ),
+    )
     plc_tag = forms.CharField(
         label='PLC Variable',
         max_length=120,
@@ -72,14 +144,27 @@ class PlcReadForm(forms.Form):
     def clean(self):
         cleaned = super().clean()
         ip = cleaned.get('plc_ip_address', '').strip()
+        brand = cleaned.get('plc_brand', 'allen_bradley')
         slot = cleaned.get('plc_slot')
         if slot in (None, ''):
             slot = 0
         cleaned['plc_slot'] = slot
         if ip:
             cleaned['plc_ip'] = f'{ip}/{slot}'
+        # Siemens rack and slot are always 0
+        cleaned['plc_rack'] = 0
+        # Ensure defaults for Modbus fields
+        port = cleaned.get('plc_port')
+        if port in (None, ''):
+            cleaned['plc_port'] = None
+        operation = cleaned.get('modbus_operation') or 'read'
+        if cleaned.get('plc_brand') == 'pymodbus' and operation == 'write' and not cleaned.get('modbus_write_value', '').strip():
+            self.add_error('modbus_write_value', 'Enter a value to write.')
+        # Siemens write validation
+        siemens_op = cleaned.get('siemens_operation') or 'read'
+        if brand == 'siemens_snap7' and siemens_op == 'write' and not cleaned.get('siemens_write_value', '').strip():
+            self.add_error('siemens_write_value', 'Enter a value to write.')
         return cleaned
-
 
 class OpcUaFetchForm(forms.Form):
     opcua_host = forms.CharField(
@@ -166,12 +251,12 @@ class PlcConfigLoadForm(forms.Form):
     def __init__(self, *args, **kwargs):
         file_choices = kwargs.pop('file_choices', ())
         super().__init__(*args, **kwargs)
-        self.fields['config_file'].choices = file_choices or (('', 'No saved YAML files found'),)
+        self.fields['config_file'].choices = file_choices or (('', 'No saved Config files found'),)
         self.fields['config_file'].widget.attrs.update({'id': 'config_file'})
 
 
 class PlcConfigImportForm(forms.Form):
-    config_upload = forms.FileField(label='Import YAML File', required=True)
+    config_upload = forms.FileField(label='Import Config File', required=True)
 
     def clean_config_upload(self):
         file_obj = self.cleaned_data['config_upload']

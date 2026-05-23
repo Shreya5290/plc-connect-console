@@ -1,4 +1,6 @@
+import asyncio
 import re
+import struct
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -9,10 +11,13 @@ from time import perf_counter
 import yaml
 from django.conf import settings
 from django.contrib import messages
+from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
 from django.views import View
+from django.views.decorators.http import require_GET
 from pycomm3 import LogixDriver, Tag
+from pymodbus.client import ModbusTcpClient
 
 from .forms import (
     ClearHistoryForm,
@@ -28,6 +33,19 @@ try:
 except Exception:
     OpcUaClient = None
     ua = None
+
+_SNAP7_IMPORT_ERROR = None
+_Snap7Client = None
+try:
+    # snap7 v3.0+ is pure Python - use the new s7 package
+    from s7 import Client as _Snap7Client
+except Exception:
+    try:
+        # Fallback: snap7 v2.x legacy API
+        from snap7.client import Client as _Snap7Client
+    except Exception as _snap7_exc:
+        _Snap7Client = None
+        _SNAP7_IMPORT_ERROR = str(_snap7_exc)
 
 
 @dataclass
@@ -155,6 +173,597 @@ class LogixService:
             state.message = f'Connection error: {exc}'
 
         return state, display_path
+
+class PymodbusService:
+    """Lightweight Modbus TCP reader for simple numeric/register tag names.
+
+    Supported tag formats:
+    - numeric string (e.g. "40001") - read holding register label 40001 as offset 0
+    - "holding:ADDR" / "coil:ADDR" / "input:ADDR" to specify type
+    """
+
+
+    @staticmethod
+    def _parse_host(path):
+        path = (path or '').strip()
+        if not path:
+            return '', ''
+        parts = [p for p in path.split('/') if p]
+        host = parts[0] if parts else ''
+        display = path
+        return host, display
+
+    @staticmethod
+    def _is_error_response(result):
+        if result is None:
+            return True
+        is_error = getattr(result, 'isError', None)
+        if callable(is_error):
+            return bool(is_error())
+        is_error = getattr(result, 'is_error', None)
+        if callable(is_error):
+            return bool(is_error())
+        return bool(is_error)
+
+    @staticmethod
+    def _to_modbus_offset(func, address):
+        """Convert common Modbus reference labels to zero-based offsets."""
+        if func in ('holding', 'reg', 'register') and 40000 <= address <= 49999:
+            return address - 40000, f'40001-style label {address}'
+        if func in ('input', 'input_register', 'input_registers') and 30000 <= address <= 39999:
+            return address - 30000, f'30001-style label {address}'
+        if func in ('discrete_input', 'discrete', 'input_discrete') and 10000 <= address <= 19999:
+            return address - 10000, f'10001-style label {address}'
+        return address, f'offset {address}'
+
+    @staticmethod
+    def _register_count(data_type):
+        if data_type in ('uint32', 'int32', 'float32'):
+            return 2
+        return 1
+
+    @staticmethod
+    def _decode_registers(registers, data_type):
+        if not registers:
+            return None
+        first = int(registers[0])
+        if data_type == 'int16':
+            return first - 0x10000 if first & 0x8000 else first
+        if data_type == 'uint32':
+            return (first << 16) | int(registers[1])
+        if data_type == 'int32':
+            value = (first << 16) | int(registers[1])
+            return value - 0x100000000 if value & 0x80000000 else value
+        if data_type == 'float32':
+            return struct.unpack('>f', struct.pack('>HH', first, int(registers[1])))[0]
+        if data_type == 'bool':
+            return bool(first)
+        return first
+
+    @staticmethod
+    def _parse_bool(value):
+        normalized = str(value).strip().lower()
+        if normalized in ('1', 'true', 'on', 'yes'):
+            return True
+        if normalized in ('0', 'false', 'off', 'no'):
+            return False
+        raise ValueError('Boolean values must be true/false or 1/0.')
+
+    @classmethod
+    def _encode_registers(cls, value, data_type):
+        value = str(value).strip()
+        if data_type == 'bool':
+            return [1 if cls._parse_bool(value) else 0]
+        if data_type == 'int16':
+            number = int(value)
+            if not -32768 <= number <= 32767:
+                raise ValueError('Int16 value must be between -32768 and 32767.')
+            return [number & 0xFFFF]
+        if data_type == 'uint32':
+            number = int(value)
+            if not 0 <= number <= 0xFFFFFFFF:
+                raise ValueError('UInt32 value must be between 0 and 4294967295.')
+            return [(number >> 16) & 0xFFFF, number & 0xFFFF]
+        if data_type == 'int32':
+            number = int(value)
+            if not -2147483648 <= number <= 2147483647:
+                raise ValueError('Int32 value must be between -2147483648 and 2147483647.')
+            number &= 0xFFFFFFFF
+            return [(number >> 16) & 0xFFFF, number & 0xFFFF]
+        if data_type == 'float32':
+            return list(struct.unpack('>HH', struct.pack('>f', float(value))))
+        number = int(value)
+        if not 0 <= number <= 65535:
+            raise ValueError('UInt16 value must be between 0 and 65535.')
+        return [number]
+
+    def connect_and_read(
+        self,
+        ip,
+        tag_name,
+        port=None,
+        unit=1,
+        count=1,
+        function='holding',
+        operation='read',
+        data_type='uint16',
+        write_value='',
+    ):
+        state = ViewState(tag_name=tag_name)
+        host, display = self._parse_host(ip)
+        if not host:
+            state.message = 'PLC address must follow this format: 10.191.175.15/1'
+            return state, display
+
+        state.connection_path = display
+        effective_port = int(port) if port else 502
+
+        try:
+            client = ModbusTcpClient(host, port=effective_port)
+            if not client.connect():
+                state.message = f'Unable to connect to Modbus PLC at {display} (port {effective_port}) — verify the PLC is powered on, reachable, and Modbus TCP is enabled.'
+                return state, display
+
+            tag = (tag_name or '').strip()
+            if not tag:
+                state.message = f'Connected to Modbus PLC at {display} (no tag requested)'
+                client.close()
+                return state, display
+
+            # Determine read type and address
+            read_type = 'holding'
+            address = None
+            if ':' in tag:
+                typ, addr = tag.split(':', 1)
+                read_type = typ.lower()
+                address = addr.strip()
+            else:
+                address = tag
+
+            try:
+                addr = int(address)
+            except Exception:
+                state.message = 'For pymodbus reads, use a numeric register address or prefix (e.g. holding:40001 or coil:10)'
+                client.close()
+                return state, display
+
+            func = (read_type if ':' in tag else function or read_type or 'holding').lower()
+            addr, address_label = self._to_modbus_offset(func, addr)
+            operation = (operation or 'read').lower()
+            data_type = (data_type or 'uint16').lower()
+            count = self._register_count(data_type) if func in ('holding', 'reg', 'register', 'input', 'input_register', 'input_registers') else 1
+            try:
+                if operation == 'write':
+                    if func == 'coil':
+                        value = self._parse_bool(write_value)
+                        result = client.write_coil(addr, value, device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Write failed for coil {address_label}: {error_msg}' if error_msg else f'Write failed for coil {address_label}'
+                        else:
+                            state.tag_value = value
+                            state.tag_status = f'Coil {address_label} written at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    elif func in ('holding', 'reg', 'register'):
+                        registers = self._encode_registers(write_value, data_type)
+                        if len(registers) == 1:
+                            result = client.write_register(addr, registers[0], device_id=int(unit))
+                        else:
+                            result = client.write_registers(addr, registers, device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Write failed for holding register {address_label}: {error_msg}' if error_msg else f'Write failed for holding register {address_label}'
+                        else:
+                            state.tag_value = write_value
+                            state.tag_status = f'{data_type.upper()} value written to {address_label} at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    else:
+                        state.message = 'Writes are supported only for holding registers and coils.'
+                elif func in ('holding', 'reg', 'register'):
+                    try:
+                        result = client.read_holding_registers(addr, count=int(count), device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Read failed for holding register {address_label}: {error_msg}' if error_msg else f'Read failed for holding register {address_label}'
+                        else:
+                            regs = getattr(result, 'registers', []) or []
+                            state.tag_value = self._decode_registers(regs, data_type)
+                            state.tag_status = f'Holding register {address_label} read as {data_type.upper()} at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    except Exception as exc:
+                        state.message = f'Read error for holding register {address_label}: {exc}'
+                elif func == 'coil':
+                    try:
+                        result = client.read_coils(addr, count=int(count), device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Read failed for coil {address_label}: {error_msg}' if error_msg else f'Read failed for coil {address_label}'
+                        else:
+                            bits = getattr(result, 'bits', []) or []
+                            state.tag_value = bits[0] if bits else None
+                            state.tag_status = f'Coil {address_label} read at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    except Exception as exc:
+                        state.message = f'Read error for coil {address_label}: {exc}'
+                elif func in ('input', 'input_register', 'input_registers'):
+                    # Read input registers (function code 4)
+                    try:
+                        result = client.read_input_registers(addr, count=int(count), device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Read failed for input register {address_label}: {error_msg}' if error_msg else f'Read failed for input register {address_label}'
+                        else:
+                            regs = getattr(result, 'registers', []) or []
+                            state.tag_value = self._decode_registers(regs, data_type)
+                            state.tag_status = f'Input register {address_label} read as {data_type.upper()} at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    except Exception as exc:
+                        state.message = f'Read error for input register {address_label}: {exc}'
+                elif func in ('discrete_input', 'discrete', 'input_discrete'):
+                    # Read discrete inputs (function code 2)
+                    try:
+                        result = client.read_discrete_inputs(addr, count=int(count), device_id=int(unit))
+                        if self._is_error_response(result):
+                            error_msg = getattr(result, 'exception', '') or getattr(result, 'message', '')
+                            state.message = f'Read failed for discrete input {address_label}: {error_msg}' if error_msg else f'Read failed for discrete input {address_label}'
+                        else:
+                            bits = getattr(result, 'bits', []) or []
+                            state.tag_value = bits[0] if bits else None
+                            state.tag_status = f'Discrete input {address_label} read at offset {addr}'
+                            state.message = f'Connected to Modbus PLC at {display}'
+                    except Exception as exc:
+                        state.message = f'Read error for discrete input {address_label}: {exc}'
+                else:
+                    state.message = f'Unsupported Modbus read type: {func}. Use holding, coil, input, or discrete_input.'
+            except Exception as exc:
+                state.message = f'Modbus read/write error on {display}: {exc}'
+
+            client.close()
+        except ConnectionError as exc:
+            state.message = f'Modbus connection to {display} (port {effective_port}) refused — check network and PLC settings. ({exc})'
+        except Exception as exc:
+            state.message = f'Modbus error on {display}: {exc}'
+
+        return state, display
+
+
+class Snap7Service:
+    """Siemens S7 PLC communication via python-snap7.
+
+    Supports reading/writing:
+    - DB (Data Blocks): DB1.DBW0, DB1.DBD4, DB1.DBX0.0, DB1.DBB10
+    - Merkers (M): MW0, MD4, MX0.0, MB10
+    - Inputs (I/E): IW0, ID4, IX0.0, IB10
+    - Outputs (Q/A): QW0, QD4, QX0.0, QB10
+    - Counters (C): C0, C1
+    - Timers (T): T0, T1
+
+    Address format examples:
+      DB1.DBW0   -> Data Block 1, Word at offset 0
+      DB1.DBD4   -> Data Block 1, DWord at offset 4
+      DB1.DBX0.1 -> Data Block 1, Bit at byte 0, bit 1
+      DB1.DBB10  -> Data Block 1, Byte at offset 10
+      DB1.REAL4  -> Data Block 1, Real (float) at offset 4
+      MW100      -> Merker Word at offset 100
+      MD0        -> Merker DWord at offset 0
+      MX0.0      -> Merker Bit at byte 0, bit 0
+      IW0        -> Input Word at offset 0
+      QW0        -> Output Word at offset 0
+      C0         -> Counter 0
+      T0         -> Timer 0
+    """
+
+    # Regex patterns for address parsing
+    DB_PATTERN = re.compile(
+        r'^DB(\d+)\.DB([XBWDL])(\d+)(?:\.(\d))?$', re.IGNORECASE
+    )
+    DB_REAL_PATTERN = re.compile(
+        r'^DB(\d+)\.(?:REAL|DBR)(\d+)$', re.IGNORECASE
+    )
+    AREA_PATTERN = re.compile(
+        r'^([MQIE])([XBWDL])(\d+)(?:\.(\d))?$', re.IGNORECASE
+    )
+    AREA_REAL_PATTERN = re.compile(
+        r'^([MQIE])REAL(\d+)$', re.IGNORECASE
+    )
+    COUNTER_PATTERN = re.compile(r'^C(\d+)$', re.IGNORECASE)
+    TIMER_PATTERN = re.compile(r'^T(\d+)$', re.IGNORECASE)
+
+    SIZE_MAP = {
+        'X': 1,   # Bit (read 1 byte, extract bit)
+        'B': 1,   # Byte
+        'W': 2,   # Word (16-bit)
+        'D': 4,   # DWord (32-bit)
+        'L': 8,   # LWord (64-bit)
+    }
+
+    @staticmethod
+    def _parse_host(ip_input):
+        """Extract IP and display path from input like '192.168.0.1' or '192.168.0.1/0/1'."""
+        ip_input = (ip_input or '').strip()
+        if not ip_input:
+            return '', ''
+        host = ip_input.strip()
+        display = host
+        return host, display
+
+    def _parse_address(self, address):
+        """Parse a Siemens address string into components.
+
+        Returns dict with keys: area, db_number, data_type, offset, bit, size
+        Or None if address is not recognized.
+        """
+        address = (address or '').strip().upper()
+        if not address:
+            return None
+
+        # DB with REAL: DB1.REAL4
+        m = self.DB_REAL_PATTERN.match(address)
+        if m:
+            return {
+                'area': 'DB',
+                'db_number': int(m.group(1)),
+                'data_type': 'REAL',
+                'offset': int(m.group(2)),
+                'bit': None,
+                'size': 4,
+            }
+
+        # DB addresses: DB1.DBW0, DB1.DBX0.1, DB1.DBD4
+        m = self.DB_PATTERN.match(address)
+        if m:
+            db_num = int(m.group(1))
+            type_char = m.group(2).upper()
+            offset = int(m.group(3))
+            bit = int(m.group(4)) if m.group(4) is not None else None
+            return {
+                'area': 'DB',
+                'db_number': db_num,
+                'data_type': type_char,
+                'offset': offset,
+                'bit': bit,
+                'size': self.SIZE_MAP.get(type_char, 1),
+            }
+
+        # Area REAL: MREAL0, IREAL4
+        m = self.AREA_REAL_PATTERN.match(address)
+        if m:
+            area_char = m.group(1).upper()
+            offset = int(m.group(2))
+            return {
+                'area': area_char,
+                'db_number': 0,
+                'data_type': 'REAL',
+                'offset': offset,
+                'bit': None,
+                'size': 4,
+            }
+
+        # Area addresses: MW0, QX0.0, IB4
+        m = self.AREA_PATTERN.match(address)
+        if m:
+            area_char = m.group(1).upper()
+            type_char = m.group(2).upper()
+            offset = int(m.group(3))
+            bit = int(m.group(4)) if m.group(4) is not None else None
+            return {
+                'area': area_char,
+                'db_number': 0,
+                'data_type': type_char,
+                'offset': offset,
+                'bit': bit,
+                'size': self.SIZE_MAP.get(type_char, 1),
+            }
+
+        # Counter
+        m = self.COUNTER_PATTERN.match(address)
+        if m:
+            return {
+                'area': 'C',
+                'db_number': 0,
+                'data_type': 'W',
+                'offset': int(m.group(1)),
+                'bit': None,
+                'size': 2,
+            }
+
+        # Timer
+        m = self.TIMER_PATTERN.match(address)
+        if m:
+            return {
+                'area': 'T',
+                'db_number': 0,
+                'data_type': 'W',
+                'offset': int(m.group(1)),
+                'bit': None,
+                'size': 2,
+            }
+
+        return None
+
+    # Area read method names for snap7 v3.x
+    AREA_READ_MAP = {
+        'M': 'mb_read',   # Merkers
+        'Q': 'ab_read',   # Outputs (Ausgänge)
+        'A': 'ab_read',   # Outputs (German)
+        'I': 'eb_read',   # Inputs (Eingänge)
+        'E': 'eb_read',   # Inputs (German)
+    }
+    AREA_WRITE_MAP = {
+        'M': 'mb_write',
+        'Q': 'ab_write',
+        'A': 'ab_write',
+        'I': 'eb_write',
+        'E': 'eb_write',
+    }
+
+    def _read_area(self, client, parsed):
+        """Read data from the PLC based on parsed address."""
+        area = parsed['area']
+        offset = parsed['offset']
+        size = parsed['size']
+        db_number = parsed['db_number']
+        data_type = parsed['data_type']
+        bit = parsed['bit']
+
+        if area == 'DB':
+            data = client.db_read(db_number, offset, size)
+        elif area == 'C':
+            data = client.ct_read(offset)
+            return int.from_bytes(bytes(data) if not isinstance(data, (bytes, bytearray)) else data, 'big') if data else 0
+        elif area == 'T':
+            data = client.tm_read(offset)
+            return int.from_bytes(bytes(data) if not isinstance(data, (bytes, bytearray)) else data, 'big') if data else 0
+        else:
+            method = self.AREA_READ_MAP.get(area)
+            if method is None:
+                raise ValueError(f'Unknown area: {area}')
+            data = getattr(client, method)(offset, size)
+
+        return self._decode_data(data, data_type, bit)
+
+    def _decode_data(self, data, data_type, bit):
+        """Decode raw bytes into the appropriate Python value."""
+        if data_type == 'X':
+            byte_val = data[0] if isinstance(data, (bytes, bytearray)) else int(data)
+            return bool((byte_val >> (bit or 0)) & 1)
+        elif data_type == 'B':
+            return data[0] if isinstance(data, (bytes, bytearray)) else int(data)
+        elif data_type == 'W':
+            return int.from_bytes(data[:2], 'big')
+        elif data_type == 'D':
+            return int.from_bytes(data[:4], 'big')
+        elif data_type == 'L':
+            return int.from_bytes(data[:8], 'big')
+        elif data_type == 'REAL':
+            return struct.unpack('>f', data[:4])[0]
+        return int.from_bytes(data, 'big')
+
+    def _write_area(self, client, parsed, value):
+        """Write a value to the PLC based on parsed address."""
+        area = parsed['area']
+        offset = parsed['offset']
+        db_number = parsed['db_number']
+        data_type = parsed['data_type']
+        bit = parsed['bit']
+
+        if area in ('C', 'T'):
+            raise ValueError(f'Writing to {"counters" if area == "C" else "timers"} is not supported via Snap7.')
+
+        write_data = self._encode_value(value, data_type, bit, client, parsed)
+
+        if area == 'DB':
+            client.db_write(db_number, offset, write_data)
+        else:
+            method = self.AREA_WRITE_MAP.get(area)
+            if method is None:
+                raise ValueError(f'Unknown area: {area}')
+            getattr(client, method)(offset, write_data)
+
+    def _encode_value(self, value, data_type, bit, client, parsed):
+        """Encode a Python value into bytes for writing."""
+        value_str = str(value).strip()
+
+        if data_type == 'X':
+            # For bit writes, read current byte first, modify only the target bit
+            area = parsed['area']
+            offset = parsed['offset']
+            db_number = parsed['db_number']
+            if area == 'DB':
+                current = client.db_read(db_number, offset, 1)
+            else:
+                method = self.AREA_READ_MAP.get(area)
+                current = getattr(client, method)(offset, 1) if method else bytearray(1)
+            byte_val = current[0] if isinstance(current, (bytes, bytearray)) else 0
+            bool_val = value_str.lower() in ('1', 'true', 'on', 'yes')
+            if bool_val:
+                byte_val |= (1 << (bit or 0))
+            else:
+                byte_val &= ~(1 << (bit or 0))
+            return bytearray([byte_val])
+        elif data_type == 'B':
+            return bytearray([int(value_str) & 0xFF])
+        elif data_type == 'W':
+            return int(value_str).to_bytes(2, 'big')
+        elif data_type == 'D':
+            return int(value_str).to_bytes(4, 'big')
+        elif data_type == 'L':
+            return int(value_str).to_bytes(8, 'big')
+        elif data_type == 'REAL':
+            return bytearray(struct.pack('>f', float(value_str)))
+        else:
+            return int(value_str).to_bytes(2, 'big')
+
+    def connect_and_read(self, ip, tag_name, operation='read', write_value=''):
+        """Connect to Siemens PLC and read/write the specified address."""
+        state = ViewState(tag_name=tag_name)
+
+        if _Snap7Client is None:
+            detail = f' ({_SNAP7_IMPORT_ERROR})' if _SNAP7_IMPORT_ERROR else ''
+            state.message = f'python-snap7 could not be loaded{detail}.'
+            return state, ip
+
+        host, display = self._parse_host(ip)
+        if not host:
+            state.message = 'Enter a valid Siemens PLC IP address (e.g., 192.168.0.1)'
+            return state, ''
+
+        state.connection_path = display
+        tag = (tag_name or '').strip()
+
+        try:
+            client = _Snap7Client()
+            client.connect(host, 0, 0)
+
+            if not client.get_connected():
+                state.message = f'Unable to connect to Siemens PLC at {display} — verify IP and that the PLC allows remote access.'
+                return state, display
+
+            if not tag:
+                state.message = f'Connected to Siemens PLC at {display} (no address requested)'
+                client.disconnect()
+                return state, display
+
+            parsed = self._parse_address(tag)
+            if parsed is None:
+                state.message = (
+                    f'Invalid Siemens address: "{tag}". '
+                    'Use formats like DB1.DBW0, DB1.DBX0.1, MW0, QX0.0, IW0, C0, T0'
+                )
+                client.disconnect()
+                return state, display
+
+            operation = (operation or 'read').strip().lower()
+
+            if operation == 'write':
+                if not write_value.strip():
+                    state.message = 'Enter a value to write.'
+                    client.disconnect()
+                    return state, display
+                self._write_area(client, parsed, write_value)
+                state.tag_value = write_value
+                state.tag_status = f'Value written to {tag}'
+                state.message = f'Connected to Siemens PLC at {display}'
+            else:
+                result = self._read_area(client, parsed)
+                state.tag_value = result
+                state.tag_status = f'Read {tag} successfully'
+                state.message = f'Connected to Siemens PLC at {display}'
+
+            client.disconnect()
+        except Exception as exc:
+            err = str(exc)
+            hint = ''
+            if '0x81' in err and '0x04' in err:
+                hint = (
+                    ' Possible causes: '
+                    '(1) PUT/GET communication is disabled — enable it in TIA Portal under '
+                    'PLC Properties → Protection → "Permit access with PUT/GET communication". '
+                    '(2) DB block has "Optimized block access" enabled — disable it in TIA Portal.'
+                )
+            state.message = f'Siemens PLC error at {display}: {exc}{hint}'
+
+        return state, display
 
 
 class OpcUaService:
@@ -327,13 +936,16 @@ class LandingDataStore:
                 'discovered_tags': [],
             },
             'bridge': {
-                'mode': 'plc_to_scada',
+                'mode': 'json_async_bridge',
+                'active': False,
+                'poll_interval_seconds': 1.0,
                 'node_address_map': {},
                 'mapped_count': 0,
                 'synced_count': 0,
                 'last_sync_at': None,
                 'last_sync_result': '',
                 'last_sync_status_map': {},
+                'last_sync_snapshot': {},
             },
             'runtime': {
                 'last_action': 'initialized',
@@ -412,9 +1024,13 @@ class LandingDataStore:
     def sync_from_session(self, request, action, message, backup_reason=None):
         def mutate(payload):
             plc_path = request.session.get('last_plc_ip', '')
+            existing_bridge = payload.get('bridge') or {}
             payload['plc'] = {
                 'brand': request.session.get('last_plc_brand', 'allen_bradley'),
                 'connection_path': plc_path,
+                'port': request.session.get('last_plc_port'),
+                'rack': 0,
+                'siemens_slot': 0,
                 'last_tag': request.session.get('last_plc_tag', ''),
                 'last_value': request.session.get('landing_last_plc_value'),
                 'last_status': request.session.get('landing_last_plc_status', ''),
@@ -425,25 +1041,661 @@ class LandingDataStore:
                 'discovered_tags': request.session.get('opcua_last_tags', []),
             }
             payload['bridge'] = {
-                'mode': 'plc_to_scada',
-                'node_address_map': request.session.get('opcua_plc_address_map', {}),
-                'mapped_count': len(request.session.get('opcua_plc_address_map', {})),
+                'mode': 'json_async_bridge',
+                'active': bool(existing_bridge.get('active', False)),
+                'poll_interval_seconds': existing_bridge.get('poll_interval_seconds', 1.0),
+                'node_address_map': request.session.get(CombinedPageView.BRIDGE_MAP_KEY, {}),
+                'mapped_count': len(request.session.get(CombinedPageView.BRIDGE_MAP_KEY, {})),
                 'synced_count': request.session.get('landing_last_synced_count', 0),
                 'last_sync_at': request.session.get('landing_last_sync_at'),
                 'last_sync_result': request.session.get('landing_last_sync_result', ''),
-                'last_sync_status_map': request.session.get('opcua_sync_status_map', {}),
+                'last_sync_status_map': existing_bridge.get('last_sync_status_map', {}),
+                'last_sync_snapshot': existing_bridge.get('last_sync_snapshot', {}),
             }
             self.append_task(payload, action, message)
 
         return self.update(mutate, backup_reason=backup_reason)
 
+class AsyncBridgeService:
+    def __init__(self, store, logix_service, pool, opcua_service):
+        self.store = store
+        self.logix_service = logix_service
+        self.pool = pool
+        self.opcua_service = opcua_service
+        self._thread = None
+        self._guard = threading.Lock()
+        self._stop_event = threading.Event()
 
+    @staticmethod
+    def _values_match(left, right):
+        if left is None and right is None:
+            return True
+        if isinstance(left, bool) or isinstance(right, bool):
+            return left is right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return float(left) == float(right)
+        if isinstance(left, list) and isinstance(right, list) and len(left) == len(right):
+            return all(AsyncBridgeService._values_match(a, b) for a, b in zip(left, right))
+        if isinstance(left, dict) and isinstance(right, dict) and set(left.keys()) == set(right.keys()):
+            return all(AsyncBridgeService._values_match(left[key], right[key]) for key in left)
+        return left == right
+
+    @staticmethod
+    def _parse_modbus_tag(plc_tag):
+        """Parse a Modbus tag string into (function_type, address).
+
+        Handles formats like '40001', 'holding:40001', 'coil:10'.
+        Returns e.g. ('holding', 40001).
+        """
+        plc_tag = str(plc_tag or '').strip()
+        func = 'holding'
+        address = plc_tag
+        if ':' in plc_tag:
+            typ, addr = plc_tag.split(':', 1)
+            func = typ.lower()
+            address = addr.strip()
+        return func, int(address)
+
+    @staticmethod
+    def _normalize_plc_address(plc_tag, plc_brand='allen_bradley'):
+        """Normalize PLC address using the same logic as Register/Coil Address mapping.
+        
+        For Modbus (pymodbus):
+        - Converts label-style addresses (40001-49999 for holding, 30001-39999 for input, etc.)
+          to zero-based offsets
+        - Also handles function type prefixes like 'holding:40001' or 'coil:10'
+        
+        For Allen-Bradley:
+        - Returns the tag as-is (native tag names don't need normalization)
+        """
+        plc_tag = str(plc_tag or '').strip()
+        if not plc_tag:
+            return plc_tag, plc_tag
+        
+        # For Allen-Bradley, no normalization needed
+        if plc_brand not in {'pymodbus', 'modbus'}:
+            return plc_tag, plc_tag
+        
+        # For Modbus/pymodbus, parse and normalize like PymodbusService does
+        read_type = 'holding'
+        address = None
+        if ':' in plc_tag:
+            typ, addr = plc_tag.split(':', 1)
+            read_type = typ.lower()
+            address = addr.strip()
+        else:
+            address = plc_tag
+        
+        try:
+            addr = int(address)
+        except (ValueError, TypeError):
+            # Not a numeric address, return as-is
+            return plc_tag, plc_tag
+        
+        func = read_type.lower()
+        
+        # Apply Modbus address offset conversion (same as PymodbusService._to_modbus_offset)
+        if func in ('holding', 'reg', 'register') and 40000 <= addr <= 49999:
+            offset = addr - 40000
+            return str(offset), f'40001-style label {addr}'
+        if func in ('input', 'input_register', 'input_registers') and 30000 <= addr <= 39999:
+            offset = addr - 30000
+            return str(offset), f'30001-style label {addr}'
+        if func in ('discrete_input', 'discrete', 'input_discrete') and 10000 <= addr <= 19999:
+            offset = addr - 10000
+            return str(offset), f'10001-style label {addr}'
+        if func == 'coil' and 1 <= addr <= 9999:
+            return str(addr), f'coil {addr}'
+        
+        # Return original if no conversion applies
+        return plc_tag, plc_tag
+
+    @staticmethod
+    def _coerce_for_variant(value, variant_type):
+        if value is None:
+            return None
+        if variant_type in (
+            ua.VariantType.SByte,
+            ua.VariantType.Byte,
+            ua.VariantType.Int16,
+            ua.VariantType.UInt16,
+            ua.VariantType.Int32,
+            ua.VariantType.UInt32,
+            ua.VariantType.Int64,
+            ua.VariantType.UInt64,
+        ):
+            return int(value)
+        if variant_type in (ua.VariantType.Float, ua.VariantType.Double):
+            return float(value)
+        if variant_type == ua.VariantType.Boolean:
+            if isinstance(value, str):
+                return value.strip().lower() in ('1', 'true', 'yes', 'on')
+            return bool(value)
+        if variant_type == ua.VariantType.String:
+            return str(value)
+        return value
+
+    @staticmethod
+    def _coerce_for_plc_value(value, plc_current_value):
+        if value is None:
+            return None
+        if isinstance(plc_current_value, bool):
+            if isinstance(value, str):
+                return value.strip().lower() in ('1', 'true', 'yes', 'on')
+            return bool(value)
+        if isinstance(plc_current_value, int) and not isinstance(plc_current_value, bool):
+            return int(value)
+        if isinstance(plc_current_value, float):
+            return float(value)
+        if isinstance(plc_current_value, str):
+            return str(value)
+        if isinstance(plc_current_value, list):
+            if not isinstance(value, list):
+                raise ValueError('Expected a list value for the PLC tag.')
+            return value
+        if isinstance(plc_current_value, dict):
+            if not isinstance(value, dict):
+                raise ValueError('Expected an object value for the PLC tag.')
+            return value
+        return value
+
+    def ensure_running(self):
+        with self._guard:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._thread_main, name='plc-opcua-bridge', daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        with self._guard:
+            self._stop_event.set()
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=5)
+
+    def _thread_main(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._watch_forever())
+        finally:
+            loop.close()
+
+    async def _watch_forever(self):
+        poll_interval = 1.0
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.to_thread(self.run_cycle, False)
+                poll_interval = 1.0
+            except Exception as exc:
+                print(f'Bridge cycle error: {exc}')
+                poll_interval = min(5.0, poll_interval + 0.5)
+            
+            try:
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                break
+
+    def run_cycle(self, force_plc_to_scada=False):
+        """Run a single sync cycle and persist to JSON."""
+        if self._stop_event.is_set():
+            return
+        return self.store.update(
+            lambda payload: self._sync_payload(payload, force_plc_to_scada=force_plc_to_scada)
+        )
+
+    def _sync_payload(self, payload, force_plc_to_scada=False):
+        bridge = payload.setdefault('bridge', {})
+        bridge.setdefault('mode', 'json_async_bridge')
+        bridge.setdefault('active', False)
+        bridge.setdefault('poll_interval_seconds', 1.0)
+        bridge.setdefault('last_sync_status_map', {})
+        bridge.setdefault('last_sync_snapshot', {})
+
+        if not bridge.get('active'):
+            return
+
+        plc_path = str((payload.get('plc') or {}).get('connection_path', '') or '').strip()
+        plc_brand = str((payload.get('plc') or {}).get('brand', 'allen_bradley') or 'allen_bradley').strip().lower()
+        is_modbus = plc_brand in {'pymodbus', 'modbus'}
+        is_siemens = plc_brand == 'siemens_snap7'
+        endpoint_input = str((payload.get('scada') or {}).get('endpoint', '') or '').strip()
+        endpoint = _opcua_service.normalize_endpoint(endpoint_input)
+        address_map = bridge.get('node_address_map') or {}
+        pairs = [(node_id, plc_tag) for node_id, plc_tag in address_map.items() if node_id and plc_tag]
+        status_map = {}
+        snapshot_map = bridge.get('last_sync_snapshot') or {}
+
+        if not endpoint:
+            bridge['active'] = False
+            bridge['last_sync_result'] = 'Bridge stopped: OPC UA endpoint is missing or invalid.'
+            bridge['last_sync_status_map'] = {}
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            return
+
+        internal_path, display_path = self.logix_service.normalize_path(plc_path)
+        if is_modbus:
+            # Modbus addresses don't follow Allen-Bradley IP/slot format
+            host, display_path = PymodbusService._parse_host(plc_path)
+            if not host:
+                bridge['active'] = False
+                bridge['last_sync_result'] = 'Bridge stopped: Modbus PLC address is missing or invalid.'
+                bridge['last_sync_status_map'] = {}
+                bridge['last_sync_at'] = timezone.localtime().isoformat()
+                return
+            internal_path = host
+        elif is_siemens:
+            host, display_path, _, _ = Snap7Service._parse_host(plc_path)
+            if not host:
+                bridge['active'] = False
+                bridge['last_sync_result'] = 'Bridge stopped: Siemens PLC address is missing or invalid.'
+                bridge['last_sync_status_map'] = {}
+                bridge['last_sync_at'] = timezone.localtime().isoformat()
+                return
+            internal_path = host
+        elif not internal_path:
+            bridge['active'] = False
+            bridge['last_sync_result'] = 'Bridge stopped: PLC address is missing or invalid.'
+            bridge['last_sync_status_map'] = {}
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            return
+
+        if not pairs:
+            bridge['active'] = False
+            bridge['last_sync_result'] = 'Bridge stopped: no valid PLC-to-NodeID mappings were configured.'
+            bridge['last_sync_status_map'] = {}
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            return
+
+        opcua_client = OpcUaClient(endpoint, timeout=4)
+        success_count = 0
+        aligned_count = 0
+        conflict_count = 0
+        failed_count = 0
+
+        try:
+            opcua_client.connect()
+
+            # For Modbus, normalize PLC addresses; for Allen-Bradley/Siemens, use tags as-is
+            normalized_pairs = []
+            if is_modbus:
+                for node_id, plc_tag in pairs:
+                    normalized_tag, address_label = self._normalize_plc_address(plc_tag, plc_brand)
+                    normalized_pairs.append((node_id, normalized_tag, plc_tag, address_label))
+            else:
+                normalized_pairs = [(node_id, plc_tag, plc_tag, plc_tag) for node_id, plc_tag in pairs]
+
+            if is_siemens:
+                # --- Siemens Snap7 path ---
+                _snap7_service = globals().get('_snap7_service')
+                if _snap7_service is None:
+                    _snap7_service = Snap7Service()
+                    globals()['_snap7_service'] = _snap7_service
+                host, _ = Snap7Service._parse_host(plc_path)
+                if not host:
+                    raise RuntimeError(f'Invalid Siemens PLC address: {plc_path}')
+                if _Snap7Client is None:
+                    raise RuntimeError('python-snap7 library could not be loaded.')
+                s7_client = _Snap7Client()
+                s7_client.connect(host, 0, 0)
+                if not s7_client.get_connected():
+                    raise RuntimeError(f'Unable to connect to Siemens PLC at {host}')
+                try:
+                    for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
+                        try:
+                            parsed = _snap7_service._parse_address(normalized_tag)
+                            if parsed is None:
+                                status_map[node_id] = f'Invalid Siemens address: {address_label}'
+                                failed_count += 1
+                                continue
+                            plc_value = _snap7_service._read_area(s7_client, parsed)
+
+                            node = opcua_client.get_node(node_id)
+                            variant_type = node.get_data_type_as_variant_type()
+                            scada_value = node.get_value()
+                            snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
+                            has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
+
+                            if force_plc_to_scada or not has_snapshot:
+                                if not self._values_match(plc_value, scada_value):
+                                    typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                    node.set_value(typed_value, variant_type)
+                                    scada_value = typed_value
+                                    success_count += 1
+                                    status_map[node_id] = f'Connected: copied PLC {address_label} to NodeID.'
+                                else:
+                                    aligned_count += 1
+                                    status_map[node_id] = f'Connected: PLC {address_label} and NodeID already match.'
+                            else:
+                                plc_changed = not self._values_match(plc_value, snapshot.get('plc_value'))
+                                scada_changed = not self._values_match(scada_value, snapshot.get('scada_value'))
+
+                                if plc_changed and not scada_changed:
+                                    typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                    node.set_value(typed_value, variant_type)
+                                    scada_value = typed_value
+                                    success_count += 1
+                                    status_map[node_id] = f'PLC changed: updated NodeID from {address_label}.'
+                                elif scada_changed and not plc_changed:
+                                    _snap7_service._write_area(s7_client, parsed, scada_value)
+                                    plc_value = scada_value
+                                    success_count += 1
+                                    status_map[node_id] = f'SCADA changed: updated PLC tag {address_label}.'
+                                elif plc_changed and scada_changed:
+                                    if self._values_match(plc_value, scada_value):
+                                        aligned_count += 1
+                                        status_map[node_id] = f'Both sides changed for {address_label}, but values now match.'
+                                    else:
+                                        _snap7_service._write_area(s7_client, parsed, scada_value)
+                                        plc_value = scada_value
+                                        success_count += 1
+                                        status_map[node_id] = f'Conflict resolved: SCADA value written to PLC {address_label}.'
+                                else:
+                                    aligned_count += 1
+                                    status_map[node_id] = f'No change detected for {address_label}.'
+
+                            snapshot_map[node_id] = {
+                                'plc_tag': original_tag,
+                                'plc_value': plc_value,
+                                'scada_value': scada_value,
+                                'synced_at': timezone.localtime().isoformat(),
+                            }
+                        except Exception as exc:
+                            status_map[node_id] = f'Sync failed: {exc}'
+                            failed_count += 1
+                finally:
+                    s7_client.disconnect()
+            elif is_modbus:
+                # --- Modbus path: use ModbusTcpClient directly ---
+                host = PymodbusService._parse_host(plc_path)[0]
+                if not host:
+                    raise RuntimeError(f'Invalid Modbus PLC address: {plc_path}')
+                plc_port = int((payload.get('plc') or {}).get('port') or 5020)
+                modbus_client = ModbusTcpClient(host, port=plc_port)
+                if not modbus_client.connect():
+                    raise RuntimeError(f'Unable to connect to Modbus PLC at {plc_path}')
+                try:
+                    read_map = {}
+                    for _, normalized_tag, original_tag, address_label in normalized_pairs:
+                        try:
+                            func, addr = self._parse_modbus_tag(original_tag)
+                            addr, label = PymodbusService._to_modbus_offset(func, addr)
+                            count = PymodbusService._register_count('uint16')
+                            if func in ('holding', 'reg', 'register'):
+                                result = modbus_client.read_holding_registers(addr, count=count, device_id=1)
+                            elif func == 'coil':
+                                result = modbus_client.read_coils(addr, count=1, device_id=1)
+                            elif func in ('input', 'input_register', 'input_registers'):
+                                result = modbus_client.read_input_registers(addr, count=count, device_id=1)
+                            elif func in ('discrete_input', 'discrete', 'input_discrete'):
+                                result = modbus_client.read_discrete_inputs(addr, count=1, device_id=1)
+                            else:
+                                result = modbus_client.read_holding_registers(addr, count=count, device_id=1)
+                            if PymodbusService._is_error_response(result):
+                                read_map[normalized_tag] = None
+                            else:
+                                regs = getattr(result, 'registers', None)
+                                bits = getattr(result, 'bits', None)
+                                if regs is not None:
+                                    read_map[normalized_tag] = PymodbusService._decode_registers(regs, 'uint16')
+                                elif bits is not None:
+                                    read_map[normalized_tag] = bits[0] if bits else None
+                                else:
+                                    read_map[normalized_tag] = None
+                        except Exception as exc:
+                            read_map[normalized_tag] = None
+
+                    for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
+                        try:
+                            plc_value = read_map.get(normalized_tag)
+                            if plc_value is None:
+                                status_map[node_id] = f'PLC read failed for {address_label}'
+                                failed_count += 1
+                                continue
+
+                            node = opcua_client.get_node(node_id)
+                            variant_type = node.get_data_type_as_variant_type()
+                            scada_value = node.get_value()
+                            snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
+                            has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
+
+                            if force_plc_to_scada or not has_snapshot:
+                                if not self._values_match(plc_value, scada_value):
+                                    typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                    node.set_value(typed_value, variant_type)
+                                    scada_value = typed_value
+                                    success_count += 1
+                                    status_map[node_id] = f'Connected: copied PLC {address_label} to NodeID.'
+                                else:
+                                    aligned_count += 1
+                                    status_map[node_id] = f'Connected: PLC {address_label} and NodeID already match.'
+                            else:
+                                plc_changed = not self._values_match(plc_value, snapshot.get('plc_value'))
+                                scada_changed = not self._values_match(scada_value, snapshot.get('scada_value'))
+
+                                if plc_changed and not scada_changed:
+                                    typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                    node.set_value(typed_value, variant_type)
+                                    scada_value = typed_value
+                                    success_count += 1
+                                    status_map[node_id] = f'PLC changed: updated NodeID from {address_label}.'
+                                elif scada_changed and not plc_changed:
+                                    # Write SCADA value back to Modbus register
+                                    try:
+                                        func, addr = self._parse_modbus_tag(original_tag)
+                                        addr, _ = PymodbusService._to_modbus_offset(func, addr)
+                                        write_val = int(scada_value)
+                                        if func == 'coil':
+                                            modbus_client.write_coil(addr, bool(write_val), device_id=1)
+                                        else:
+                                            modbus_client.write_register(addr, write_val, device_id=1)
+                                        plc_value = scada_value
+                                        success_count += 1
+                                        status_map[node_id] = f'SCADA changed: updated PLC tag {address_label}.'
+                                    except Exception as exc:
+                                        status_map[node_id] = f'PLC write failed for {address_label}: {exc}'
+                                        failed_count += 1
+                                        continue
+                                elif plc_changed and scada_changed:
+                                    if self._values_match(plc_value, scada_value):
+                                        aligned_count += 1
+                                        status_map[node_id] = f'Both sides changed for {address_label}, but values now match.'
+                                    else:
+                                        # Conflict: SCADA wins — write SCADA value to PLC
+                                        try:
+                                            func, addr = self._parse_modbus_tag(original_tag)
+                                            addr, _ = PymodbusService._to_modbus_offset(func, addr)
+                                            write_val = int(scada_value)
+                                            if func == 'coil':
+                                                modbus_client.write_coil(addr, bool(write_val), device_id=1)
+                                            else:
+                                                modbus_client.write_register(addr, write_val, device_id=1)
+                                            plc_value = scada_value
+                                            success_count += 1
+                                            status_map[node_id] = f'Conflict resolved: SCADA value written to PLC {address_label}.'
+                                        except Exception as exc:
+                                            status_map[node_id] = f'Conflict write failed for {address_label}: {exc}'
+                                            failed_count += 1
+                                            continue
+                                else:
+                                    aligned_count += 1
+                                    status_map[node_id] = f'No change detected for {address_label}.'
+
+                            snapshot_map[node_id] = {
+                                'plc_tag': original_tag,
+                                'plc_value': plc_value,
+                                'scada_value': scada_value,
+                                'synced_at': timezone.localtime().isoformat(),
+                            }
+                        except Exception as exc:
+                            status_map[node_id] = f'Sync failed: {exc}'
+                            failed_count += 1
+                finally:
+                    modbus_client.close()
+            else:
+                # --- Allen-Bradley path: use LogixDriver pool ---
+                plc = self.pool.get(internal_path)
+                if not plc.connected:
+                    raise RuntimeError(f'Unable to connect to PLC at {display_path}')
+
+                plc_tags = [normalized_tag for _, normalized_tag, _, _ in normalized_pairs]
+                read_results = plc.read(*plc_tags) if plc_tags else []
+                if plc_tags and not isinstance(read_results, list):
+                    read_results = [read_results]
+                read_map = {tag_name: result for tag_name, result in zip(plc_tags, read_results)}
+
+                for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
+                    try:
+                        read_result = read_map.get(normalized_tag)
+                        plc_value, read_status = self.logix_service.parse_result(read_result)
+                        if 'failed' in read_status.lower() or plc_value is None:
+                            status_map[node_id] = f'PLC read failed for {address_label}: {read_status}'
+                            failed_count += 1
+                            continue
+
+                        node = opcua_client.get_node(node_id)
+                        variant_type = node.get_data_type_as_variant_type()
+                        scada_value = node.get_value()
+                        snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
+                        has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
+
+                        if force_plc_to_scada or not has_snapshot:
+                            if not self._values_match(plc_value, scada_value):
+                                typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                node.set_value(typed_value, variant_type)
+                                scada_value = typed_value
+                                success_count += 1
+                                status_map[node_id] = f'Connected: copied PLC {address_label} to NodeID.'
+                            else:
+                                aligned_count += 1
+                                status_map[node_id] = f'Connected: PLC {address_label} and NodeID already match.'
+                        else:
+                            plc_changed = not self._values_match(plc_value, snapshot.get('plc_value'))
+                            scada_changed = not self._values_match(scada_value, snapshot.get('scada_value'))
+
+                            if plc_changed and not scada_changed:
+                                typed_value = self._coerce_for_variant(plc_value, variant_type)
+                                node.set_value(typed_value, variant_type)
+                                scada_value = typed_value
+                                success_count += 1
+                                status_map[node_id] = f'PLC changed: updated NodeID from {address_label}.'
+                            elif scada_changed and not plc_changed:
+                                typed_value = self._coerce_for_plc_value(scada_value, plc_value)
+                                write_result = plc.write((normalized_tag, typed_value))
+                                _, write_status = self.logix_service.parse_result(write_result)
+                                if 'failed' in write_status.lower():
+                                    status_map[node_id] = f'PLC write failed for {address_label}: {write_status}'
+                                    failed_count += 1
+                                    continue
+                                plc_value = typed_value
+                                success_count += 1
+                                status_map[node_id] = f'SCADA changed: updated PLC tag {address_label}.'
+                            elif plc_changed and scada_changed:
+                                if self._values_match(plc_value, scada_value):
+                                    aligned_count += 1
+                                    status_map[node_id] = f'Both sides changed for {address_label}, but values now match.'
+                                else:
+                                    # Conflict: SCADA wins — write SCADA value to PLC
+                                    typed_value = self._coerce_for_plc_value(scada_value, plc_value)
+                                    write_result = plc.write((normalized_tag, typed_value))
+                                    _, write_status = self.logix_service.parse_result(write_result)
+                                    if 'failed' in write_status.lower():
+                                        status_map[node_id] = f'Conflict write failed for {address_label}: {write_status}'
+                                        failed_count += 1
+                                        continue
+                                    plc_value = typed_value
+                                    success_count += 1
+                                    status_map[node_id] = f'Conflict resolved: SCADA value written to PLC {address_label}.'
+                            else:
+                                aligned_count += 1
+                                status_map[node_id] = f'No change detected for {address_label}.'
+
+                        snapshot_map[node_id] = {
+                            'plc_tag': original_tag,
+                            'plc_value': plc_value,
+                            'scada_value': scada_value,
+                            'synced_at': timezone.localtime().isoformat(),
+                        }
+                    except Exception as exc:
+                        status_map[node_id] = f'Sync failed: {exc}'
+                        failed_count += 1
+
+            bridge['synced_count'] = success_count
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            bridge['last_sync_result'] = (
+                f'Bridge cycle: {success_count} updates, {aligned_count} aligned, '
+                f'{conflict_count} conflicts, {failed_count} failures.'
+            )
+            bridge['last_sync_status_map'] = status_map
+            bridge['last_sync_snapshot'] = snapshot_map
+            payload['runtime'] = {
+                'last_action': 'bridge_monitor_cycle',
+                'last_message': bridge['last_sync_result'],
+            }
+        except Exception as exc:
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            bridge['last_sync_result'] = f'Bridge cycle failed: {exc}'
+            bridge['last_sync_status_map'] = {node_id: f'Connection error: {exc}' for node_id, _, _, _ in normalized_pairs}
+            payload['runtime'] = {
+                'last_action': 'bridge_monitor_cycle',
+                'last_message': bridge['last_sync_result'],
+            }
+        finally:
+            try:
+                opcua_client.disconnect()
+            except Exception:
+                pass
+
+
+# Initialize global instances after all classes are defined
 _landing_store = LandingDataStore(_LANDING_DATA_FILE, _LANDING_BACKUP_DIR)
 _landing_store.read()
+
+# Initialize async bridge service after landing store is ready
+_async_bridge = AsyncBridgeService(
+    store=_landing_store,
+    logix_service=_logix_service,
+    pool=_logix_pool,
+    opcua_service=_opcua_service,
+)
+
+# Auto-restart bridge if it was active before server restart
+_init_payload = _landing_store.read()
+if _init_payload.get('bridge', {}).get('active'):
+    _async_bridge.ensure_running()
+del _init_payload
+
+
+@require_GET
+def bridge_status_api(request):
+    """Lightweight JSON endpoint for polling bridge sync status."""
+    try:
+        payload = _landing_store.read()
+        bridge = payload.get('bridge', {})
+        return JsonResponse({
+            'active': bool(bridge.get('active', False)),
+            'result': bridge.get('last_sync_result', ''),
+            'sync_at': bridge.get('last_sync_at', ''),
+            'status_map': bridge.get('last_sync_status_map', {}),
+        })
+    except Exception as exc:
+        return JsonResponse({'active': False, 'error': str(exc)}, status=500)
 
 
 class CombinedPageView(View):
     template_name = 'index.html'
+    BRIDGE_SNAPSHOT_KEY = 'bridge_last_sync_snapshot'
+    BRIDGE_STATUS_KEY = 'opcua_sync_status_map'
+    BRIDGE_MAP_KEY = 'opcua_plc_address_map'
+
+    @classmethod
+    def _prune_bridge_snapshot(cls, session, address_map):
+        snapshot = session.get(cls.BRIDGE_SNAPSHOT_KEY, {})
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        valid = {node_id: snapshot.get(node_id, {}) for node_id in address_map if node_id in snapshot}
+        session[cls.BRIDGE_SNAPSHOT_KEY] = valid
+        return valid
 
     @staticmethod
     def _split_plc_path(path):
@@ -476,37 +1728,12 @@ class CombinedPageView(View):
             return host, 4840
 
     @staticmethod
-    def _coerce_for_variant(value, variant_type):
-        if value is None:
-            return None
-        if variant_type in (
-            ua.VariantType.SByte,
-            ua.VariantType.Byte,
-            ua.VariantType.Int16,
-            ua.VariantType.UInt16,
-            ua.VariantType.Int32,
-            ua.VariantType.UInt32,
-            ua.VariantType.Int64,
-            ua.VariantType.UInt64,
-        ):
-            return int(value)
-        if variant_type in (ua.VariantType.Float, ua.VariantType.Double):
-            return float(value)
-        if variant_type == ua.VariantType.Boolean:
-            if isinstance(value, str):
-                return value.strip().lower() in ('1', 'true', 'yes', 'on')
-            return bool(value)
-        if variant_type == ua.VariantType.String:
-            return str(value)
-        return value
-
-    @staticmethod
     def _build_common_rows(request):
         rows = []
         if not request.session.get('opcua_last_tags', []):
             return rows
-        address_map = request.session.get('opcua_plc_address_map', {})
-        status_map = request.session.get('opcua_sync_status_map', {})
+        address_map = request.session.get(CombinedPageView.BRIDGE_MAP_KEY, {})
+        status_map = request.session.get(CombinedPageView.BRIDGE_STATUS_KEY, {})
 
         for node_id, plc_address in sorted(address_map.items()):
             rows.append(
@@ -573,7 +1800,7 @@ class CombinedPageView(View):
                 'endpoint': request.session.get('last_opcua_endpoint', ''),
             },
             'mappings': {
-                'node_address_map': request.session.get('opcua_plc_address_map', {}),
+                'node_address_map': request.session.get(self.BRIDGE_MAP_KEY, {}),
             },
         }
 
@@ -594,7 +1821,7 @@ class CombinedPageView(View):
         if slot < 0:
             slot = 0
         brand = str(plc.get('brand', 'allen_bradley') or 'allen_bradley').strip().lower()
-        if brand not in {'allen_bradley', 'siemens', 'modbus'}:
+        if brand not in {'allen_bradley', 'pymodbus', 'siemens_snap7'}:
             brand = 'allen_bradley'
         tag = str(plc.get('tag', '') or '').strip()
 
@@ -616,17 +1843,23 @@ class CombinedPageView(View):
         request.session['last_plc_brand'] = brand
         request.session['last_plc_tag'] = tag
         request.session['last_opcua_endpoint'] = opcua_endpoint
-        request.session['opcua_plc_address_map'] = cleaned_map
-        request.session['opcua_sync_status_map'] = {}
+        request.session[cls.BRIDGE_MAP_KEY] = cleaned_map
+        request.session[cls.BRIDGE_STATUS_KEY] = {}
+        cls._prune_bridge_snapshot(request.session, cleaned_map)
 
     @staticmethod
     def _clear_plc_config_session(request):
+        # Clear all PLC configuration and address data
         request.session['last_plc_ip'] = ''
         request.session['last_plc_brand'] = 'allen_bradley'
         request.session['last_plc_tag'] = ''
         request.session['last_opcua_endpoint'] = ''
-        request.session['opcua_plc_address_map'] = {}
-        request.session['opcua_sync_status_map'] = {}
+        # Clear address mappings table
+        request.session[CombinedPageView.BRIDGE_MAP_KEY] = {}
+        request.session[CombinedPageView.BRIDGE_STATUS_KEY] = {}
+        request.session[CombinedPageView.BRIDGE_SNAPSHOT_KEY] = {}
+        # Explicitly mark session as modified to ensure persistence
+        request.session.modified = True
 
     def _build_context(
         self,
@@ -643,7 +1876,7 @@ class CombinedPageView(View):
         plc_state.history = _plc_history.get(request.session)
         opcua_state.history = _opcua_history.get(request.session)
         has_discovered_tags = bool(request.session.get('opcua_last_tags', []))
-        has_opcua_tags = bool(request.session.get('opcua_plc_address_map', {})) and has_discovered_tags
+        has_opcua_tags = bool(request.session.get(self.BRIDGE_MAP_KEY, {})) and has_discovered_tags
         plc_config_save_form = plc_config_save_form or PlcConfigSaveForm()
         plc_config_load_form = plc_config_load_form or PlcConfigLoadForm(file_choices=self._config_file_choices())
         plc_config_import_form = plc_config_import_form or PlcConfigImportForm()
@@ -659,10 +1892,26 @@ class CombinedPageView(View):
             'has_opcua_tags': has_opcua_tags,
             'has_discovered_tags': has_discovered_tags,
             'show_tag_popup': show_tag_popup and has_discovered_tags,
-            'landing_data_file': _LANDING_DATA_FILE.name,
-            'landing_backup_dir': str(_LANDING_BACKUP_DIR.relative_to(settings.BASE_DIR)).replace('\\', '/'),
-            'landing_recent_backup_file': str(_RECENT_BACKUP_FILE.relative_to(settings.BASE_DIR)).replace('\\', '/'),
+            'bridge_active': self._get_bridge_active(),
+            'bridge_result': self._get_bridge_result(),
         }
+
+    @staticmethod
+    def _get_bridge_active():
+        try:
+            payload = _landing_store.read()
+            return bool(payload.get('bridge', {}).get('active', False))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _get_bridge_result():
+        try:
+            payload = _landing_store.read()
+            bridge = payload.get('bridge', {})
+            return bridge.get('last_sync_result', '')
+        except Exception:
+            return ''
 
     @staticmethod
     def _cached_opcua_state(session):
@@ -677,21 +1926,54 @@ class CombinedPageView(View):
     def get(self, request):
         last_plc_ip = request.session.get('last_plc_ip', '')
         ip_address, slot = self._split_plc_path(last_plc_ip)
+        # Read port from session first, then from cache
+        saved_port = request.session.get('last_plc_port')
+        if saved_port is None:
+            try:
+                saved_port = _landing_store.read().get('plc', {}).get('port')
+            except Exception:
+                pass
         plc_form = PlcReadForm(
             initial={
                 'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
                 'plc_ip_address': ip_address,
                 'plc_slot': slot,
                 'plc_tag': request.session.get('last_plc_tag', ''),
+                'plc_port': saved_port,
             }
         )
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
         plc_state = ViewState()
         opcua_state = self._cached_opcua_state(request.session)
+        
+        # Restore bridge state from JSON if active
+        try:
+            payload = _landing_store.read()
+            bridge = payload.get('bridge', {})
+            if bridge.get('active', False):
+                address_map = bridge.get('node_address_map', {})
+                status_map = bridge.get('last_sync_status_map', {})
+                snapshot_map = bridge.get('last_sync_snapshot', {})
+                
+                request.session[self.BRIDGE_MAP_KEY] = address_map
+                request.session[self.BRIDGE_STATUS_KEY] = status_map
+                request.session[self.BRIDGE_SNAPSHOT_KEY] = snapshot_map
+                request.session['landing_last_synced_count'] = bridge.get('synced_count', 0)
+                request.session['landing_last_sync_at'] = bridge.get('last_sync_at')
+                request.session['landing_last_sync_result'] = bridge.get('last_sync_result', '')
+                
+                # Ensure async bridge is running
+                global _async_bridge
+                if _async_bridge:
+                    _async_bridge.ensure_running()
+        except Exception:
+            pass
+        
         return render(request, self.template_name, self._build_context(request, plc_state, opcua_state, plc_form, opcua_form))
 
     def post(self, request):
+        global _async_bridge
         action = request.POST.get('action', '').strip().lower()
         show_tag_popup = False
         plc_state = ViewState()
@@ -704,6 +1986,7 @@ class CombinedPageView(View):
                 'plc_ip_address': ip_address,
                 'plc_slot': slot,
                 'plc_tag': request.session.get('last_plc_tag', ''),
+                'plc_port': request.session.get('last_plc_port'),
             }
         )
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
@@ -718,10 +2001,51 @@ class CombinedPageView(View):
                 plc_ip = plc_form.cleaned_data['plc_ip']
                 plc_brand = plc_form.cleaned_data['plc_brand']
                 plc_tag = plc_form.cleaned_data['plc_tag'].strip()
-                plc_state, display_path = _logix_service.connect_and_read(plc_ip, plc_tag)
+                # If user selected pymodbus as the PLC brand, use the PymodbusService
+                if plc_brand == 'pymodbus':
+                    _pymodbus_service = globals().get('_pymodbus_service')
+                    if _pymodbus_service is None:
+                        _pymodbus_service = PymodbusService()
+                        globals()['_pymodbus_service'] = _pymodbus_service
+                    port = plc_form.cleaned_data.get('plc_port')
+                    function = plc_form.cleaned_data.get('modbus_function', 'holding')
+                    operation = plc_form.cleaned_data.get('modbus_operation', 'read')
+                    data_type = plc_form.cleaned_data.get('modbus_data_type', 'uint16')
+                    write_value = plc_form.cleaned_data.get('modbus_write_value', '')
+                    plc_state, display_path = _pymodbus_service.connect_and_read(
+                        plc_ip,
+                        plc_tag,
+                        port=port,
+                        unit=1,
+                        count=1,
+                        function=function,
+                        operation=operation,
+                        data_type=data_type,
+                        write_value=write_value,
+                    )
+                elif plc_brand == 'siemens_snap7':
+                    _snap7_service = globals().get('_snap7_service')
+                    if _snap7_service is None:
+                        _snap7_service = Snap7Service()
+                        globals()['_snap7_service'] = _snap7_service
+                    operation = plc_form.cleaned_data.get('siemens_operation', 'read')
+                    write_value = plc_form.cleaned_data.get('siemens_write_value', '')
+                    ip_address = plc_form.cleaned_data.get('plc_ip_address', '').strip()
+                    plc_state, display_path = _snap7_service.connect_and_read(
+                        ip_address,
+                        plc_tag,
+                        operation=operation,
+                        write_value=write_value,
+                    )
+                else:
+                    plc_state, display_path = _logix_service.connect_and_read(plc_ip, plc_tag)
                 request.session['last_plc_ip'] = plc_ip
                 request.session['last_plc_brand'] = plc_brand
                 request.session['last_plc_tag'] = plc_tag
+                if plc_brand == 'pymodbus':
+                    request.session['last_plc_port'] = port
+                elif plc_brand == 'siemens_snap7':
+                    request.session['last_plc_ip'] = ip_address
                 _plc_history.add(
                     request.session,
                     {
@@ -732,7 +2056,7 @@ class CombinedPageView(View):
                         'when': timezone.localtime().strftime('%Y-%m-%d %H:%M:%S'),
                     },
                 )
-                if plc_state.message.startswith('Connected to PLC'):
+                if plc_state.message.startswith(('Connected to PLC', 'Connected to Modbus PLC', 'Connected to Siemens PLC')):
                     messages.success(request, plc_state.message)
                 else:
                     messages.error(request, plc_state.message)
@@ -755,7 +2079,7 @@ class CombinedPageView(View):
                 if opcua_state.tag_name == 'Discovered tags' and isinstance(opcua_state.tag_value, list):
                     request.session['opcua_last_tags'] = opcua_state.tag_value
                     request.session['opcua_last_endpoint'] = opcua_state.connection_path or raw_endpoint
-                    request.session['opcua_sync_status_map'] = {}
+                    request.session[self.BRIDGE_STATUS_KEY] = {}
                     show_tag_popup = True
                 _opcua_history.add(
                     request.session,
@@ -782,16 +2106,17 @@ class CombinedPageView(View):
 
         elif action == 'add_selected_tags':
             selected_node_ids = request.POST.getlist('selected_node_ids')
-            address_map = request.session.get('opcua_plc_address_map', {})
-            status_map = request.session.get('opcua_sync_status_map', {})
+            address_map = request.session.get(self.BRIDGE_MAP_KEY, {})
+            status_map = request.session.get(self.BRIDGE_STATUS_KEY, {})
             added_count = 0
             for node_id in selected_node_ids:
                 if node_id not in address_map:
                     address_map[node_id] = ''
                     status_map[node_id] = ''
                     added_count += 1
-            request.session['opcua_plc_address_map'] = address_map
-            request.session['opcua_sync_status_map'] = status_map
+            request.session[self.BRIDGE_MAP_KEY] = address_map
+            request.session[self.BRIDGE_STATUS_KEY] = status_map
+            self._prune_bridge_snapshot(request.session, address_map)
             if added_count > 0:
                 messages.success(request, f'Added {added_count} tags to mapping.')
             else:
@@ -802,8 +2127,9 @@ class CombinedPageView(View):
                 message=f'Added {added_count} OPC UA tags to PLC/SCADA mapping.',
             )
 
-        elif action == 'sync_opcua_to_plc':
-            endpoint = request.session.get('opcua_last_endpoint', '').strip()
+        elif action == 'connect_bridge':
+            # Collect current mapping and credentials, enable bridge, start async monitoring
+            endpoint = request.session.get('last_opcua_endpoint', '').strip()
             plc_ip = request.session.get('last_plc_ip', '').strip()
             node_ids = request.POST.getlist('node_ids')
             plc_addresses = request.POST.getlist('plc_addresses')
@@ -814,95 +2140,97 @@ class CombinedPageView(View):
                 plc_tag = plc_addresses[idx].strip() if idx < len(plc_addresses) else ''
                 if node_id:
                     address_map[node_id] = plc_tag
-            request.session['opcua_plc_address_map'] = address_map
+            
+            request.session[self.BRIDGE_MAP_KEY] = address_map
+            snapshot_map = self._prune_bridge_snapshot(request.session, address_map)
 
             pairs = [(node_id, plc_tag) for node_id, plc_tag in address_map.items() if node_id and plc_tag]
             status_map = {}
             for node_id, plc_tag in address_map.items():
                 if not plc_tag:
-                    status_map[node_id] = 'Skipped: address is empty.'
+                    status_map[node_id] = 'Waiting: address is empty.'
 
             if not endpoint:
-                messages.error(request, 'Fetch OPC UA tags first before running connect.')
+                messages.error(request, 'Fetch OPC UA tags first before connecting.')
             elif not plc_ip:
-                messages.error(request, 'Enter a PLC address first, then run connect.')
+                messages.error(request, 'Enter a PLC address first.')
             elif not pairs:
-                messages.error(request, 'Add at least one PLC address mapping before running connect.')
+                messages.error(request, 'Map at least one PLC address before connecting.')
             elif OpcUaClient is None:
                 messages.error(request, 'OPC UA client library is not installed. Install it with: pip install opcua')
             else:
-                internal_path, display_path = _logix_service.normalize_path(plc_ip)
-                if not internal_path:
-                    messages.error(request, 'PLC address must follow this format: 10.191.175.15/1')
+                plc_brand = request.session.get('last_plc_brand', 'allen_bradley')
+                is_modbus = plc_brand in {'pymodbus', 'modbus'}
+                is_siemens = plc_brand == 'siemens_snap7'
+                if is_modbus:
+                    host, display_path = PymodbusService._parse_host(plc_ip)
+                    internal_path = host
+                elif is_siemens:
+                    host, display_path, _, _ = Snap7Service._parse_host(plc_ip)
+                    internal_path = host
                 else:
-                    opcua_client = OpcUaClient(endpoint, timeout=4)
-                    success_count = 0
-                    try:
-                        opcua_client.connect()
-                        plc = _logix_pool.get(internal_path)
-                        if not plc.connected:
-                            raise RuntimeError(f'Unable to connect to PLC at {display_path}')
-
-                        plc_tags = [plc_tag for _, plc_tag in pairs]
-                        read_results = plc.read(*plc_tags) if plc_tags else []
-                        if plc_tags and not isinstance(read_results, list):
-                            read_results = [read_results]
-                        read_map = {tag_name: result for tag_name, result in zip(plc_tags, read_results)}
-
-                        for node_id, plc_tag in pairs:
-                            try:
-                                read_result = read_map.get(plc_tag)
-                                plc_value, read_status = _logix_service.parse_result(read_result)
-                                if 'failed' in read_status.lower() or plc_value is None:
-                                    status_map[node_id] = f'PLC read failed for {plc_tag}: {read_status}'
-                                    continue
-
-                                node = opcua_client.get_node(node_id)
-                                variant_type = node.get_data_type_as_variant_type()
-                                typed_value = self._coerce_for_variant(plc_value, variant_type)
-                                node.set_value(ua.DataValue(ua.Variant(typed_value, variant_type)))
-                                status_map[node_id] = f'Synced PLC {plc_tag} -> NodeID ({plc_value})'
-                                success_count += 1
-                            except Exception as exc:
-                                status_map[node_id] = f'Sync failed: {exc}'
-
-                        if success_count == len(pairs):
-                            messages.success(request, f'Connect completed successfully for {success_count} mapped tags.')
-                        elif success_count > 0:
-                            messages.info(
-                                request,
-                                f'Connect completed with partial success: {success_count} of {len(pairs)} mapped tags.',
-                            )
-                        else:
-                            messages.error(request, 'Connect completed with no successful tag sync operations.')
-                        request.session['landing_last_synced_count'] = success_count
-                        request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
-                        request.session['landing_last_sync_result'] = (
-                            f'Sync completed for {success_count} of {len(pairs)} mapped tags.'
+                    internal_path, display_path = _logix_service.normalize_path(plc_ip)
+                if not internal_path:
+                    messages.error(request, 'PLC address is missing or invalid.')
+                else:
+                    # Enable bridge in persistent storage
+                    def enable_bridge(payload):
+                        bridge = payload.setdefault('bridge', {})
+                        bridge['active'] = True
+                        bridge['node_address_map'] = address_map
+                        bridge['mapped_count'] = len(address_map)
+                        bridge['last_sync_status_map'] = status_map
+                        bridge['last_sync_snapshot'] = snapshot_map or {}
+                        payload['runtime'] = {
+                            'last_action': 'bridge_connected',
+                            'last_message': f'Bridge activated for {len(pairs)} mapped address(es).',
+                        }
+                    
+                    _landing_store.update(enable_bridge, backup_reason='bridge_connected')
+                    
+                    # Start async bridge service
+                    if _async_bridge:
+                        _async_bridge.ensure_running()
+                        messages.success(
+                            request,
+                            f'Continuous sync started! Monitoring {len(pairs)} mapped address(es). '
+                            f'The bridge will automatically sync PLC↔SCADA values in the background.',
                         )
-                    except Exception as exc:
-                        for node_id, _ in pairs:
-                            status_map[node_id] = f'Connection error: {exc}'
-                        messages.error(request, f'Connect failed: {exc}')
-                        request.session['landing_last_synced_count'] = 0
-                        request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
-                        request.session['landing_last_sync_result'] = f'Connect failed: {exc}'
-                    finally:
-                        try:
-                            opcua_client.disconnect()
-                        except Exception:
-                            pass
+                    else:
+                        messages.error(request, 'Bridge service initialization failed.')
+                    
+                    request.session[self.BRIDGE_STATUS_KEY] = status_map
+                    request.session[self.BRIDGE_SNAPSHOT_KEY] = snapshot_map or {}
+                    request.session['landing_last_synced_count'] = 0
+                    request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
+                    request.session['landing_last_sync_result'] = f'Bridge activated for {len(pairs)} mappings.'
 
-            request.session['opcua_sync_status_map'] = status_map
-            _landing_store.sync_from_session(
-                request,
-                action='sync_opcua_to_plc',
-                message=request.session.get('landing_last_sync_result', 'Sync attempt completed.'),
-                backup_reason='sync_opcua_to_plc',
-            )
+        elif action == 'refresh_bridge':
+            # Force a sync cycle and refresh the page with latest bridge data
+            if _async_bridge:
+                try:
+                    _async_bridge.run_cycle(force_plc_to_scada=False)
+                except Exception as exc:
+                    messages.error(request, f'Refresh failed: {exc}')
+            # Reload bridge state from JSON into session
+            try:
+                payload = _landing_store.read()
+                bridge = payload.get('bridge', {})
+                address_map = bridge.get('node_address_map', {})
+                status_map = bridge.get('last_sync_status_map', {})
+                snapshot_map = bridge.get('last_sync_snapshot', {})
+                request.session[self.BRIDGE_MAP_KEY] = address_map
+                request.session[self.BRIDGE_STATUS_KEY] = status_map
+                request.session[self.BRIDGE_SNAPSHOT_KEY] = snapshot_map
+                sync_result = bridge.get('last_sync_result', '')
+                messages.success(request, f'Bridge refreshed. {sync_result}')
+            except Exception as exc:
+                messages.error(request, f'Failed to read bridge state: {exc}')
 
         elif action == 'clear_table_addresses':
-            request.session['opcua_plc_address_map'] = {}
+            request.session[self.BRIDGE_MAP_KEY] = {}
+            request.session[self.BRIDGE_STATUS_KEY] = {}
+            request.session[self.BRIDGE_SNAPSHOT_KEY] = {}
             messages.info(request, 'All table address inputs have been cleared.')
             _landing_store.sync_from_session(
                 request,
@@ -1010,7 +2338,7 @@ class CombinedPageView(View):
 
         elif action == 'clear_plc_config':
             self._clear_plc_config_session(request)
-            messages.info(request, 'PLC configuration values have been cleared from the current session.')
+            messages.info(request, 'PLC configuration and address mappings have been cleared from the current session.')
             plc_form = PlcReadForm(
                 initial={
                     'plc_brand': 'allen_bradley',
