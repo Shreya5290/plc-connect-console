@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -33,15 +34,20 @@
 
     *{box-sizing:border-box}
 
-    body{
+    html, body{
       margin:0;
+      padding:0;
+      height:100%;
+      overflow:hidden;
+    }
+
+    body{
       color:var(--ink);
       font-family:"Segoe UI Variable","Trebuchet MS","Segoe UI",sans-serif;
       background:
         radial-gradient(1000px 500px at -10% -14%, #d4e8f6 0%, transparent 60%),
         radial-gradient(900px 450px at 110% -18%, #d7efe8 0%, transparent 62%),
         linear-gradient(180deg, #edf4f9 0%, #e8f0f6 100%);
-      padding:22px;
     }
 
     .app{
@@ -49,11 +55,11 @@
       margin:0 auto;
       background:var(--panel);
       border:1px solid var(--line);
-      border-radius:24px;
+      border-radius:0;
       box-shadow:var(--shadow);
       overflow:hidden;
       display:flex;
-      min-height:100vh;
+      height:100vh;
     }
 
     .sidebar{
@@ -61,9 +67,10 @@
       background:linear-gradient(180deg, #1a3a48 0%, #0f2937 50%, #0a1f2e 100%);
       border-right:1px solid rgba(255,255,255,.05);
       padding:28px 0;
-      overflow-y:auto;
       flex-shrink:0;
       box-shadow:2px 0 12px rgba(0,0,0,.1);
+      height:100%;
+      overflow-y:auto;
     }
 
     .sidebar::-webkit-scrollbar{
@@ -145,9 +152,14 @@
 
     .config-card input,
     .config-card select{
-      background:rgba(255,255,255,.04) !important;
-      border:1px solid rgba(255,255,255,.1) !important;
-      color:#fff !important;
+      background:#0f2d3d !important;
+      border:1px solid rgba(255,255,255,.15) !important;
+      color:#e8f4fb !important;
+    }
+
+    .config-card select option{
+      background:#0f2d3d;
+      color:#e8f4fb;
     }
 
     .config-card input::placeholder{
@@ -156,9 +168,9 @@
 
     .config-card input:focus,
     .config-card select:focus{
-      border-color:rgba(255,255,255,.2) !important;
-      background:rgba(255,255,255,.06) !important;
-      box-shadow:0 0 0 3px rgba(76,216,255,.1) !important;
+      border-color:rgba(76,216,255,.5) !important;
+      background:#0d2535 !important;
+      box-shadow:0 0 0 3px rgba(76,216,255,.12) !important;
     }
 
     .nav-item{
@@ -194,7 +206,8 @@
       flex:1;
       display:flex;
       flex-direction:column;
-      overflow:hidden;
+      overflow-y:auto;
+      min-width:0;
     }
 
     .head{
@@ -251,7 +264,6 @@
       display:flex;
       flex-direction:column;
       padding:20px;
-      overflow-y:auto;
       flex:1;
     }
 
@@ -370,6 +382,9 @@
       gap:10px;
       align-items:end;
     }
+    .plc-conn-row.modbus-mode{
+      grid-template-columns:2fr minmax(80px,110px) minmax(80px,130px);
+    }
 
     .plc-conn-row .field{
       min-width:0;
@@ -409,6 +424,34 @@
       min-width:0;
     }
 
+    .tag-search-wrap{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      margin:10px 0 6px;
+    }
+    .tag-search-input{
+      flex:1;
+      padding:8px 12px;
+      border:1px solid var(--line);
+      border-radius:8px;
+      font-size:.95rem;
+      background:var(--bg);
+      color:var(--text);
+      outline:none;
+    }
+    .tag-search-input:focus{
+      border-color:#464feb;
+      box-shadow:0 0 0 2px rgba(70,79,235,.15);
+    }
+    .tag-search-count{
+      font-size:.82rem;
+      color:var(--muted);
+      white-space:nowrap;
+    }
+    .tag-item.hidden-by-search{
+      display:none;
+    }
     .tag-selection{
       max-height:300px;
       overflow-y:auto;
@@ -674,6 +717,11 @@
       box-shadow:0 12px 24px rgba(26,127,143,.35);
     }
 
+    .btn.refresh-active{
+      background:#2980b9;
+      color:#fff;
+    }
+
     .btn.warn{
       background:linear-gradient(135deg, #ffebee 0%, #ffe0e6 100%);
       color:#c62828;
@@ -859,11 +907,43 @@
       border:1.5px solid var(--line);
       font-weight:600;
       animation:slideDown .3s ease;
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:12px;
+    }
+
+    .alert-text{
+      flex:1;
+    }
+
+    .alert-close{
+      background:none;
+      border:none;
+      cursor:pointer;
+      font-size:1.1rem;
+      line-height:1;
+      padding:0 2px;
+      opacity:.6;
+      color:inherit;
+      flex-shrink:0;
+      margin-top:1px;
+    }
+    .alert-close:hover{
+      opacity:1;
     }
 
     @keyframes slideDown{
       from{opacity:0;transform:translateY(-10px)}
       to{opacity:1;transform:translateY(0)}
+    }
+    @keyframes slideUp{
+      from{opacity:1;transform:translateY(0);max-height:200px}
+      to{opacity:0;transform:translateY(-8px);max-height:0;margin:0;padding:0;border-width:0}
+    }
+    .alert.dismissing{
+      animation:slideUp .3s ease forwards;
+      overflow:hidden;
     }
 
     .alert.success{
@@ -1168,13 +1248,17 @@
     <div class="main-wrapper">
       <header class="head">
         <span class="badge">Operations Platform</span>
+        <span class="badge" style="background:#1a1a2e;color:#64b5f6;font-size:0.75rem;margin-left:8px;">v{{ app_version }}</span>
         <h1>Click2Connect</h1>
       </header>
       
       {% if messages %}
         <section class="alerts">
           {% for message in messages %}
-            <div class="alert {{ message.tags|default:'info' }}">{{ message }}</div>
+            <div class="alert {{ message.tags|default:'info' }}">
+              <span class="alert-text">{{ message }}</span>
+              <button type="button" class="alert-close" aria-label="Close">&times;</button>
+            </div>
           {% endfor %}
         </section>
       {% endif %}
@@ -1201,17 +1285,22 @@
                   {{ opcua_form.opcua_port }}
                   {% for err in opcua_form.opcua_port.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
                 </div>
+                <div class="field">
+                  <label for="max_tags">Max Tags to Discover</label>
+                  {{ opcua_form.max_tags }}
+                  {% for err in opcua_form.max_tags.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+                </div>
               </div>
               <p class="hint">Endpoint preview: <code id="opcua-endpoint-preview">-</code></p>
 
               <button class="btn primary" type="submit">Connect and Fetch Tags</button>
-              {% if 'Connected to OPC UA' in opcua_state.message %}
+              {% if has_discovered_tags or has_opcua_tags %}
               <div class="action-row">
-                <button class="btn ghost browse-cta{% if has_discovered_tags %} ready{% endif %}" id="open-opcua-browser" type="button" {% if not has_discovered_tags %}disabled{% endif %}>
-                  {% if has_discovered_tags %}Browse OPC UA Tags{% else %}Browse OPC UA Tags (Connect First){% endif %}
+                <button class="btn ghost browse-cta{% if has_discovered_tags or has_opcua_tags %} ready{% endif %}" id="open-opcua-browser" type="button" {% if not has_discovered_tags and not has_opcua_tags %}disabled{% endif %}>
+                  Browse OPC UA Tags
                 </button>
               </div>
-              {% if has_discovered_tags %}
+              {% if has_discovered_tags or has_opcua_tags %}
                 <p class="hint flow-ok">Browse is active now.</p>
               {% else %}
                 <div class="flow-guide waiting">
@@ -1255,67 +1344,21 @@
           <section class="card card--plc">
             <div class="card-title">
               <span class="title-chip">PLC</span>
-              <h2>PLC Tag Read</h2>
+              <h2>PLC Connection</h2>
             </div>
-            {% if not has_opcua_tags %}
-              <p class="disabled-note">Enable by fetching OPC UA tags first.</p>
-            {% endif %}
             <form method="POST" novalidate>
           {% csrf_token %}
           <input type="hidden" name="action" value="plc_read">
-          <fieldset id="plc-fieldset" {% if not has_opcua_tags %}disabled{% endif %} style="border:0;padding:0;margin:0">
+          <fieldset id="plc-fieldset" style="border:0;padding:0;margin:0">
 
           <label for="plc_brand">PLC Brand</label>
           {{ plc_form.plc_brand }}
           {% for err in plc_form.plc_brand.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-          <div id="modbus-wrap" style="margin-top:8px;display:none">
-            <div class="modbus-conn-row">
-              <div class="field">
-                <label for="plc_port">Port</label>
-                {{ plc_form.plc_port }}
-                {% for err in plc_form.plc_port.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-              <div class="field">
-                <label for="modbus_function">Function</label>
-                {{ plc_form.modbus_function }}
-                {% for err in plc_form.modbus_function.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-            </div>
-            <div class="modbus-tool-row">
-              <div class="field">
-                <label for="modbus_operation">Mode</label>
-                {{ plc_form.modbus_operation }}
-                {% for err in plc_form.modbus_operation.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-              <div class="field">
-                <label for="modbus_data_type">Data Type</label>
-                {{ plc_form.modbus_data_type }}
-                {% for err in plc_form.modbus_data_type.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-              <div class="field modbus-write-row" id="modbus-write-wrap">
-                <label for="modbus_write_value">Write Value</label>
-                {{ plc_form.modbus_write_value }}
-                {% for err in plc_form.modbus_write_value.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-            </div>
+          <div id="modbus-wrap" style="display:none">
           </div>
-          <div id="siemens-wrap" style="margin-top:8px;display:none">
-            <div class="modbus-tool-row">
-              <div class="field">
-                <label for="siemens_operation">Mode</label>
-                {{ plc_form.siemens_operation }}
-                {% for err in plc_form.siemens_operation.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-              <div class="field modbus-write-row" id="siemens-write-wrap">
-                <label for="siemens_write_value">Write Value</label>
-                {{ plc_form.siemens_write_value }}
-                {% for err in plc_form.siemens_write_value.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-              </div>
-            </div>
-          </div>
-          
 
-          <div class="plc-conn-row">
+
+          <div class="plc-conn-row" id="plc-conn-row">
             <div class="field">
               <label for="plc_ip_address">PLC IP Address</label>
               {{ plc_form.plc_ip_address }}
@@ -1326,44 +1369,28 @@
               {{ plc_form.plc_slot }}
               {% for err in plc_form.plc_slot.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
             </div>
+            <div id="port-wrap" class="field" style="display:none">
+              <label for="plc_port">Port</label>
+              {{ plc_form.plc_port }}
+              {% for err in plc_form.plc_port.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+            </div>
+            <div id="word-swapped-wrap" class="field" style="display:none">
+              <label for="word_swapped">Word Swapped</label>
+              {{ plc_form.word_swapped }}
+              {% for err in plc_form.word_swapped.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
+            </div>
           </div>
           <p class="hint" id="ab-slot-note">For Allen-Bradley, slot defaults to <span class="strong">0</span> when left empty.</p>
 
           <p class="hint">Connection path preview: <code id="plc-path-preview">-</code></p>
 
-           <label for="plc_tag" id="plc-tag-label">PLC Variable</label>
-          {{ plc_form.plc_tag }}
-          <div class="format-panel" id="modbus-format-note" style="display:none">
-            <p class="hint">
-              Modbus uses register addresses. Read supports holding registers, input registers, coils, and discrete inputs.
-              Write supports holding registers and coils. Use labels or offsets such as
-              <code>40001</code>, <code>30001</code>, <code>coil:1</code>, or <code>discrete_input:1</code>.
-            </p>
-          </div>
-          <div class="format-panel" id="siemens-format-note" style="display:none">
-            <p class="hint">
-              Siemens S7 address formats:
-              <code>DB1.DBW0</code> (Word), <code>DB1.DBX0.1</code> (Bit), <code>DB1.DBD4</code> (DWord),
-              <code>DB1.REAL4</code> (Float), <code>MW0</code> (Merker Word), <code>MX0.0</code> (Merker Bit),
-              <code>IW0</code> (Input), <code>QW0</code> (Output), <code>C0</code> (Counter), <code>T0</code> (Timer).
-            </p>
-          </div>
-          {% for err in plc_form.plc_tag.errors %}<p class="field-error">{{ err }}</p>{% endfor %}
-
-          <button class="btn primary" type="submit">Connect and Read Tag</button>
+          <button class="btn primary" type="submit">Save Connection</button>
           </fieldset>
         </form>
 
         {% if plc_state.message %}
-          <div class="status {% if 'Connected to PLC' in plc_state.message or 'Connected to Modbus PLC' in plc_state.message or 'Connected to Siemens PLC' in plc_state.message or 'history cleared' in plc_state.message|lower %}ok{% else %}bad{% endif %}">{{ plc_state.message }}</div>
+          <div class="status {% if 'Connected to PLC' in plc_state.message or 'Connected to Modbus PLC' in plc_state.message or 'Connected to Siemens PLC' in plc_state.message or 'no tag requested' in plc_state.message|lower or 'history cleared' in plc_state.message|lower %}ok{% else %}bad{% endif %}">{{ plc_state.message }}</div>
         {% endif %}
-
-        <div class="kv">
-          {% if plc_state.connection_path %}<div class="k"><b>Path</b><span>{{ plc_state.connection_path }}</span></div>{% endif %}
-          {% if plc_state.tag_name %}<div class="k"><b>Tag</b><span>{{ plc_state.tag_name }}</span></div>{% endif %}
-          {% if plc_state.tag_value is not None %}<div class="k"><b>Value</b><span>{{ plc_state.tag_value }}</span></div>{% endif %}
-          {% if plc_state.tag_status %}<div class="k"><b>Status</b><span>{{ plc_state.tag_status }}</span></div>{% endif %}
-        </div>
 
         <details class="history-panel">
           <summary>PLC History</summary>
@@ -1389,6 +1416,9 @@
         </section>
 
         <section class="card card--map" style="width:100%;margin:0;">
+          <div class="action-row" style="justify-content: flex-end; margin-bottom: 8px;">
+            <button type="button" class="btn ghost browse-cta" id="add-tags-btn" {% if not has_discovered_tags and not has_opcua_tags %}disabled{% endif %}>➕ Add Tags</button>
+          </div>
           <div class="card-title">
             <span class="title-chip">Mapping</span>
             <h2>PLC Address to NodeID Mapping</h2>
@@ -1400,25 +1430,29 @@
           {% if not has_opcua_tags %}
             <p class="disabled-note">Add tags to mapping to enable address editing and bridge connection.</p>
           {% endif %}
-          <form method="POST" novalidate>
+          <form method="POST" novalidate id="remove-selected-form">
           {% csrf_token %}
+          <input type="hidden" name="action" value="remove_selected_tags">
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th style="width:90px">Sr No.</th>
+                  <th style="width:40px" class="select-col"><input type="checkbox" id="select-all-rows" style="display:none"></th>
+                  <th style="width:70px">Sr No.</th>
                   <th class="node-head">NodeID</th>
                   <th>Address</th>
+                  <th>Data Type</th>
                   <th>Status</th>
                 </tr>
               </thead>
               <tbody>
                 {% for row in common_rows %}
                 <tr>
+                  <td class="select-col"><input type="checkbox" class="row-select" name="selected_node_ids" value="{{ row.node_id }}" style="display:none"></td>
                   <td>{{ forloop.counter }}</td>
                   <td class="node-col">
                     <input type="hidden" name="node_ids" value="{{ row.node_id }}">
-                    <span class="node-cell">{{ row.node_id|default:'-' }}</span>
+                    <span class="node-cell">{{ row.tag_name|default:'-' }}</span>
                   </td>
                   <td class="path-col">
                     <input
@@ -1430,18 +1464,42 @@
                       {% if not has_opcua_tags %}disabled{% endif %}
                     >
                   </td>
+                  <td>
+                    <select name="data_types" {% if not has_opcua_tags %}disabled{% endif %}>
+                      <option value="uint16"{% if row.data_type == "uint16" %} selected{% endif %}>UInt16</option>
+                      <option value="int16"{% if row.data_type == "int16" %} selected{% endif %}>Int16</option>
+                      <option value="uint32"{% if row.data_type == "uint32" %} selected{% endif %}>UInt32</option>
+                      <option value="int32"{% if row.data_type == "int32" %} selected{% endif %}>Int32</option>
+                      <option value="uint64"{% if row.data_type == "uint64" %} selected{% endif %}>UInt64</option>
+                      <option value="int64"{% if row.data_type == "int64" %} selected{% endif %}>Int64</option>
+                      <option value="float32"{% if row.data_type == "float32" %} selected{% endif %}>Float32</option>
+                      <option value="float64"{% if row.data_type == "float64" %} selected{% endif %}>Float64</option>
+                      <option value="bool"{% if row.data_type == "bool" %} selected{% endif %}>Boolean</option>
+                      <option value="string"{% if row.data_type == "string" %} selected{% endif %}>String</option>
+                    </select>
+                  </td>
                   <td class="value-col">
-                    {% if row.status %}
-                      <span class="sync-status" data-raw="{{ row.status }}">
-                        <span class="sync-icon" id="icon-{{ forloop.counter }}"></span>
-                        <span class="sync-text">{{ row.status }}</span>
-                      </span>
-                    {% else %}-{% endif %}
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      {% if row.status %}
+                        <span class="sync-status" data-raw="{{ row.status }}">
+                          <span class="sync-icon" id="icon-{{ forloop.counter }}"></span>
+                          <span class="sync-text">{{ row.status }}</span>
+                        </span>
+                      {% else %}-{% endif %}
+                      <form method="POST" style="display:inline;" class="remove-tag-form">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="remove_tag">
+                        <input type="hidden" name="remove_node_id" value="{{ row.node_id }}">
+                        <span class="remove-tag-confirm-wrap">
+                          <button type="button" class="btn ghost remove-tag-btn" style="padding:2px 8px;font-size:.8rem;min-width:0;" title="Remove this tag">🗑</button>
+                        </span>
+                      </form>
+                    </div>
                   </td>
                 </tr>
                 {% empty %}
                 <tr>
-                  <td colspan="4">No NodeID data is available yet. Fetch OPC UA tags first.</td>
+                  <td colspan="5">No NodeID data is available yet. Fetch OPC UA tags first.</td>
                 </tr>
                 {% endfor %}
               </tbody>
@@ -1449,13 +1507,151 @@
           </div>
           <div class="action-row">
             <button class="btn primary" type="submit" name="action" value="connect_bridge" {% if not has_opcua_tags %}disabled{% endif %}>Connect & Start Sync</button>
-            <button class="btn" type="submit" name="action" value="refresh_bridge" {% if not bridge_active %}disabled{% endif %} style="{% if bridge_active %}background:#2980b9;color:#fff;{% endif %}">&#x21bb; Refresh Sync</button>
-            <button class="btn warn" type="submit" name="action" value="clear_table_addresses" {% if not has_opcua_tags %}disabled{% endif %}>Clear Addresses</button>
+            <button class="btn{% if bridge_active %} refresh-active{% endif %}" type="submit" name="action" value="refresh_bridge" {% if not bridge_active %}disabled{% endif %}>&#x21bb; Refresh Sync</button>
+            <span id="remove-selected-confirm-wrap">
+              <button type="button" class="btn warn remove-tags-btn-ui" id="remove-selected-btn" {% if not has_opcua_tags %}disabled{% endif %}>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:1.05em;">
+                  <svg width="18" height="18" viewBox="0 0 20 20" fill="none" style="vertical-align:middle"><rect x="4" y="8" width="12" height="8" rx="2" fill="#fff"/><rect x="2" y="4" width="16" height="4" rx="2" fill="#fff"/><rect x="7" y="2" width="6" height="2" rx="1" fill="#fff"/><rect x="4" y="8" width="12" height="8" rx="2" stroke="#fff" stroke-width="1.5"/><rect x="2" y="4" width="16" height="4" rx="2" stroke="#fff" stroke-width="1.5"/><rect x="7" y="2" width="6" height="2" rx="1" stroke="#fff" stroke-width="1.5"/></svg>
+                  <span>Remove Tags</span>
+                </span>
+              </button>
+            </span>
           </div>
         </form>
         </section>
       </div>
-    </div>
+    <style>
+      .select-mode .select-col input[type="checkbox"] {
+        display: inline-block !important;
+      }
+      .select-col input[type="checkbox"] {
+        display: none;
+      }
+    </style>
+    <script>
+      document.addEventListener('DOMContentLoaded', function() {
+        var tableWrap = document.querySelector('.table-wrap');
+        var table = tableWrap ? tableWrap.querySelector('table') : null;
+        var removeSelectedBtn = document.getElementById('remove-selected-btn');
+        var removeSelectedForm = document.getElementById('remove-selected-form');
+        var removeSelectedWrap = document.getElementById('remove-selected-confirm-wrap');
+        var selectAll = document.getElementById('select-all-rows');
+
+        // Intercept form submission for remove_selected_tags to remove excess fields
+        if (removeSelectedForm) {
+          removeSelectedForm.addEventListener('submit', function(e) {
+            var actionField = removeSelectedForm.querySelector('input[name="action"]');
+            if (actionField && actionField.value === 'remove_selected_tags') {
+              // Remove all node_ids, plc_addresses, data_types hidden fields to reduce POST field count
+              var fieldsToRemove = removeSelectedForm.querySelectorAll('input[name="node_ids"], input[name="plc_addresses"], select[name="data_types"]');
+              fieldsToRemove.forEach(function(field) {
+                field.remove();
+              });
+            }
+          });
+        }
+
+        // Toggle select mode
+        if (removeSelectedBtn && tableWrap) {
+          removeSelectedBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            tableWrap.classList.add('select-mode');
+            if (selectAll) selectAll.style.display = 'inline-block';
+            document.querySelectorAll('.row-select').forEach(function(cb) {
+              cb.style.display = 'inline-block';
+            });
+            if (removeSelectedWrap && !removeSelectedWrap.querySelector('.confirm-remove-selected')) {
+              removeSelectedWrap.innerHTML = `
+                <button type="submit" class="btn confirm-remove-selected" style="padding:6px 16px;font-size:.98rem;min-width:0;background:#d63545;color:#fff;border-radius:999px;box-shadow:0 2px 8px rgba(214,53,69,.13);font-weight:700;letter-spacing:.01em;transition:background .18s;" title="Confirm remove selected">
+                  <span style="display:inline-flex;align-items:center;gap:7px;">
+                    <svg width="18" height="18" viewBox="0 0 20 20" fill="none" style="vertical-align:middle"><circle cx="10" cy="10" r="9" fill="#fff"/><circle cx="10" cy="10" r="9" stroke="#fff" stroke-width="1.5"/><path d="M6 10.5L9 13.5L14 8.5" stroke="#d63545" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span>Remove Selected</span>
+                  </span>
+                </button>
+                    <style>
+                      .remove-tags-btn-ui {
+                        background: linear-gradient(90deg, #e53935 0%, #d32f2f 100%);
+                        color: #fff;
+                        border: none;
+                        border-radius: 999px;
+                        box-shadow: 0 2px 12px rgba(214,53,69,.13);
+                        font-weight: 800;
+                        padding: 10px 26px 10px 18px;
+                        font-size: 1.01rem;
+                        letter-spacing: .01em;
+                        transition: background .18s, box-shadow .18s, transform .13s;
+                        outline: none;
+                        min-width: 0;
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 7px;
+                      }
+                      .remove-tags-btn-ui:hover:not(:disabled) {
+                        background: linear-gradient(90deg, #d32f2f 0%, #b71c1c 100%);
+                        box-shadow: 0 6px 24px rgba(214,53,69,.18);
+                        transform: translateY(-2px) scale(1.03);
+                      }
+                      .remove-tags-btn-ui:active:not(:disabled) {
+                        background: #b71c1c;
+                        box-shadow: 0 2px 8px rgba(214,53,69,.13);
+                        transform: none;
+                      }
+                      .remove-tags-btn-ui:disabled {
+                        opacity: .5;
+                        filter: grayscale(.5);
+                        cursor: not-allowed;
+                      }
+                    </style>
+                <button type="button" class="btn cancel-remove-selected" style="padding:2px 8px;font-size:.9rem;min-width:0;background:#eee;color:#333;" title="Cancel">✖</button>
+              `;
+              var cancelBtn = removeSelectedWrap.querySelector('.cancel-remove-selected');
+              cancelBtn.addEventListener('click', function(ev) {
+                ev.preventDefault();
+                tableWrap.classList.remove('select-mode');
+                if (selectAll) selectAll.style.display = 'none';
+                document.querySelectorAll('.row-select').forEach(function(cb) {
+                  cb.style.display = 'none';
+                  cb.checked = false;
+                });
+                removeSelectedWrap.innerHTML = '';
+                removeSelectedWrap.appendChild(removeSelectedBtn);
+              });
+            }
+          });
+        }
+
+        // Select all rows
+        if (selectAll) {
+          selectAll.addEventListener('change', function() {
+            document.querySelectorAll('.row-select').forEach(function(cb) {
+              cb.checked = selectAll.checked;
+            });
+          });
+        }
+
+        // Per-row remove confirmation (event delegation on table)
+        if (table) {
+          table.addEventListener('click', function(e) {
+            var btn = e.target.closest('.remove-tag-btn');
+            if (!btn) return;
+            e.preventDefault();
+            var wrap = btn.parentElement;
+            if (wrap.querySelector('.confirm-remove')) return;
+            wrap.innerHTML = `
+              <button type="submit" class="btn confirm-remove" style="padding:2px 8px;font-size:.8rem;min-width:0;background:#00a86b;color:#fff;" title="Confirm remove">✔</button>
+              <button type="button" class="btn cancel-remove" style="padding:2px 8px;font-size:.8rem;min-width:0;background:#eee;color:#333;" title="Cancel">✖</button>
+            `;
+            var cancelBtn = wrap.querySelector('.cancel-remove');
+            cancelBtn.addEventListener('click', function(ev) {
+              ev.preventDefault();
+              wrap.innerHTML = '';
+              wrap.appendChild(btn);
+            });
+          });
+        }
+      });
+    </script>
+  </div>
 
   {% if has_discovered_tags %}
     <div class="popup-backdrop{% if show_tag_popup %} is-open{% endif %}" id="opcua-tag-popup">
@@ -1473,6 +1669,10 @@
             <button type="button" class="btn ghost" id="clear-all-tags">Clear Selection</button>
             <p class="hint">Selected: <b id="selected-tag-count">0</b></p>
           </div>
+          <div class="tag-search-wrap">
+            <input type="text" id="tag-search-input" class="tag-search-input" placeholder="Search tags by name, node ID, or path..." autocomplete="off">
+            <span id="tag-search-count" class="tag-search-count"></span>
+          </div>
           <div class="tag-selection">
             {% for tag in opcua_state.tag_value %}
             <div class="tag-item">
@@ -1480,7 +1680,7 @@
                 <input class="tag-select" type="checkbox" name="selected_node_ids" value="{{ tag.node_id }}">
                 <div class="tag-main-wrap">
                   <span class="tag-main">{{ tag.tag_name }}</span>
-                  <code class="tag-node">{{ tag.node_id }}</code>
+                  <!-- NodeID hidden from display, only tag name shown -->
                 </div>
                 <button type="button" class="btn ghost tag-toggle" aria-expanded="false">Show Details</button>
               </div>
@@ -1523,12 +1723,28 @@
     </div>
   {% endif %}
 {{ has_opcua_tags|json_script:"has-opcua-tags" }}
+<span id="bridge-config" data-active="{{ bridge_active|yesno:"true,false" }}" hidden></span>
 <script>
+  // Add Tags button opens the OPC UA tag browser popup
+  document.addEventListener('DOMContentLoaded', function() {
+    var addTagsBtn = document.getElementById('add-tags-btn');
+    var popup = document.getElementById('opcua-tag-popup');
+    if (addTagsBtn && popup) {
+      addTagsBtn.addEventListener('click', function() {
+        popup.classList.add('is-open');
+        var si = document.getElementById('tag-search-input');
+        if (si) { si.value = ''; si.dispatchEvent(new Event('input')); }
+      });
+    }
+  });
   (function() {
     var brand = document.getElementById('plc_brand');
     var ip = document.getElementById('plc_ip_address');
     var slot = document.getElementById('plc_slot');
     var slotWrap = document.getElementById('slot-wrap');
+    var portWrap = document.getElementById('port-wrap');
+    var wordSwappedWrap = document.getElementById('word-swapped-wrap');
+    var plcConnRow = document.getElementById('plc-conn-row');
     var modbusWrap = document.getElementById('modbus-wrap');
     var siemensWrap = document.getElementById('siemens-wrap');
     var portEl = document.getElementById('plc_port');
@@ -1559,7 +1775,10 @@
       var showModbus = selected === 'pymodbus';
       var showSiemens = selected === 'siemens_snap7';
       slotWrap.style.display = showSlot ? 'block' : 'none';
-      if (modbusWrap) modbusWrap.style.display = showModbus ? 'block' : 'none';
+      if (portWrap) portWrap.style.display = showModbus ? 'block' : 'none';
+      if (wordSwappedWrap) wordSwappedWrap.style.display = showModbus ? 'block' : 'none';
+      if (plcConnRow) plcConnRow.classList.toggle('modbus-mode', showModbus);
+      if (modbusWrap) modbusWrap.style.display = 'none';
       if (siemensWrap) siemensWrap.style.display = showSiemens ? 'block' : 'none';
       if (modbusFormatNote) modbusFormatNote.style.display = showModbus ? 'block' : 'none';
       if (siemensFormatNote) siemensFormatNote.style.display = showSiemens ? 'block' : 'none';
@@ -1666,9 +1885,54 @@
       });
     }
 
+    // --- Tag search filter ---
+    var tagSearchInput = document.getElementById('tag-search-input');
+    var tagSearchCount = document.getElementById('tag-search-count');
+    function filterTags() {
+      if (!popup) return;
+      var query = tagSearchInput ? tagSearchInput.value.toLowerCase().trim() : '';
+      var items = popup.querySelectorAll('.tag-item');
+      var visible = 0;
+      items.forEach(function(item) {
+        if (!query) {
+          item.classList.remove('hidden-by-search');
+          visible++;
+          return;
+        }
+        var name = (item.querySelector('.tag-main') || {}).textContent || '';
+        var nodeId = (item.querySelector('code') || {}).textContent || '';
+        var path = '';
+        item.querySelectorAll('.tag-meta-card').forEach(function(card) {
+          var label = (card.querySelector('b') || {}).textContent || '';
+          if (label === 'Browse Path') path = (card.querySelector('span') || {}).textContent || '';
+        });
+        var match = name.toLowerCase().includes(query) || nodeId.toLowerCase().includes(query) || path.toLowerCase().includes(query);
+        item.classList.toggle('hidden-by-search', !match);
+        if (match) visible++;
+      });
+      if (tagSearchCount) {
+        tagSearchCount.textContent = query ? visible + ' of ' + items.length + ' shown' : '';
+      }
+    }
+    if (tagSearchInput) {
+      tagSearchInput.addEventListener('input', filterTags);
+    }
+
     updatePlcUi();
     updateOpcuaUi();
     updateSelectedCount();
+
+    // --- Alert close & auto-dismiss ---
+    function dismissAlert(alert) {
+      alert.classList.add('dismissing');
+      alert.addEventListener('animationend', function() { alert.remove(); }, { once: true });
+    }
+    document.querySelectorAll('.alert-close').forEach(function(btn) {
+      btn.addEventListener('click', function() { dismissAlert(btn.closest('.alert')); });
+    });
+    document.querySelectorAll('.alert').forEach(function(alert, i) {
+      setTimeout(function() { if (alert.isConnected) dismissAlert(alert); }, 5000 + i * 300);
+    });
 
     // --- Status icon helper ---
     function statusIcon(text) {
@@ -1703,7 +1967,7 @@
     });
 
     // Auto-refresh bridge status every 5 seconds when bridge is active
-    var bridgeActive = {{ bridge_active|yesno:"true,false" }};
+    var bridgeActive = JSON.parse(document.getElementById('bridge-config').dataset.active);
     if (bridgeActive) {
       setInterval(function() {
         if (document.hidden) return;
@@ -1727,7 +1991,13 @@
               var nodeInput = row.querySelector('input[name="node_ids"]');
               if (!nodeInput) return;
               var nodeId = nodeInput.value;
+              var addressInput = row.querySelector('input[name="plc_addresses"]');
+              var addressValue = addressInput ? (addressInput.value || '').trim() : '';
               var statusCell = row.querySelector('.value-col');
+              if (statusCell && !addressValue) {
+                renderStatus(statusCell, 'Waiting: address is empty.');
+                return;
+              }
               if (statusCell && data.status_map && data.status_map[nodeId] !== undefined) {
                 renderStatus(statusCell, data.status_map[nodeId]);
               }

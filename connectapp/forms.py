@@ -9,6 +9,13 @@ CONFIG_NAME_PATTERN = re.compile(r'^[A-Za-z0-9_.\- ]+$')
 
 
 class PlcReadForm(forms.Form):
+    word_swapped = forms.ChoiceField(
+        label='Word Swapped',
+        choices=(('no', 'No'), ('yes', 'Yes')),
+        required=False,
+        initial='no',
+        widget=forms.Select(attrs={'id': 'word_swapped'}),
+    )
     plc_brand = forms.ChoiceField(
         label='PLC Brand',
         choices=(
@@ -99,8 +106,12 @@ class PlcReadForm(forms.Form):
             ('int16', 'Int16'),
             ('uint32', 'UInt32'),
             ('int32', 'Int32'),
+            ('uint64', 'UInt64'),
+            ('int64', 'Int64'),
             ('float32', 'Float32'),
+            ('float64', 'Float64'),
             ('bool', 'Boolean'),
+            ('string', 'String'),
         ),
         required=False,
         initial='uint16',
@@ -193,6 +204,20 @@ class OpcUaFetchForm(forms.Form):
             }
         ),
     )
+    max_tags = forms.IntegerField(
+        label='Max Tags to Discover',
+        required=False,
+        min_value=1,
+        max_value=10000,
+        initial=1000,
+        widget=forms.NumberInput(
+            attrs={
+                'id': 'max_tags',
+                'placeholder': '1000',
+                'autocomplete': 'off',
+            }
+        ),
+    )
 
     def clean_opcua_host(self):
         value = self.cleaned_data['opcua_host'].strip()
@@ -215,6 +240,10 @@ class OpcUaFetchForm(forms.Form):
         cleaned['opcua_port'] = port
         if host:
             cleaned['opcua_endpoint'] = f'{host}:{port}'
+        max_tags = cleaned.get('max_tags')
+        if max_tags in (None, ''):
+            max_tags = 1000
+        cleaned['max_tags'] = max_tags
         return cleaned
 
 

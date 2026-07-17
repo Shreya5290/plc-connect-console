@@ -11,9 +11,26 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 from pathlib import Path
+import sys
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+#
+# Important for PyInstaller ONEFILE:
+# PyInstaller may execute from a temporary extraction directory per run.
+# We MUST point to the stable folder where the EXE is located (the portable folder)
+# so db.sqlite3/cache/logs persist between restarts.
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+    # Also force the working directory to the stable portable folder.
+    # This ensures that relative paths (and os.getcwd()) stay consistent.
+    try:
+        import os
+        os.chdir(BASE_DIR)
+    except Exception:
+        pass
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 
 # Quick-start development settings - unsuitable for production
@@ -116,3 +133,44 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+# Increase POST field limit for bulk tag operations (default 1000)
+# Each tag row generates ~4 fields; 50+ tags × 4 = 200+, allow buffer for mappings
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 5000
+
+# Production-grade logging for bridge monitoring and diagnostics
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '[{levelname}] {asctime} {name} {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+            'level': 'INFO',
+        },
+    },
+    'loggers': {
+        'connectapp': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
+
+# Bridge service configuration for production resilience
+BRIDGE_CONFIG = {
+    'max_consecutive_failures': 50,  # Allow many retries before throttling
+    'health_check_interval': 10,  # Check health every 10 cycles
+    'poll_interval_seconds': 1.0,  # Normal poll interval
+    'connection_timeout': 5.0,  # Connection timeout in seconds
+    'read_timeout': 4.0,  # Read operation timeout
+    'write_timeout': 4.0,  # Write operation timeout
+}
