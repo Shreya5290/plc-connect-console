@@ -3,11 +3,11 @@
 Purpose:
 - Ensure the frozen executable stays alive by explicitly starting Django's server.
 - Disable Django's autoreloader (PyInstaller onefile + reloader can crash).
-- Open the browser automatically on startup.
+- Keep the server running in the terminal without auto-launching a browser.
 
 Behavior:
-- Uses the same UI URL as the server bind address: http://127.0.0.1:8000
-  (On remote PCs, this will open the local browser of that PC.)
+- Serves the UI at http://127.0.0.1:8000/ locally and binds the server to
+  all interfaces for network access.
 
 Robustness:
 - Capture unhandled exceptions into logs/startup_error.log so PyInstaller's
@@ -16,7 +16,6 @@ Robustness:
 
 import os
 import time
-import webbrowser
 import traceback
 
 
@@ -43,15 +42,9 @@ def main() -> int:
         # Let onefile extraction finish
         time.sleep(0.2)
 
-        # URL to display/open (local host)
+        # URL to display for manual browser access.
         url = "http://127.0.0.1:8000/"
-
-        # Open browser shortly after server starts
-        try:
-            webbrowser.open(url)
-        except Exception:
-            # Non-fatal on headless PCs
-            pass
+        print(f"[Startup] UI available at {url}")
 
         # Ensure DB/migrations (including django_session) exist before serving.
         # IMPORTANT: call_command requires Django apps registry to be ready.

@@ -934,7 +934,10 @@ class LandingDataStore:
     def read(self):
         with self._lock:
             payload = self._read_unlocked()
-            self._write_unlocked(payload)
+            try:
+                self._write_unlocked(payload)
+            except PermissionError:
+                pass
             return payload
 
     def _write_unlocked(self, payload):
@@ -982,7 +985,7 @@ class LandingDataStore:
                 'brand': request.session.get('last_plc_brand', 'allen_bradley'),
                 'connection_path': plc_path,
                 'port': request.session.get('last_plc_port'),
-                'word_swapped': request.session.get('last_plc_word_swapped', 'false'),
+                'word_swapped': request.session.get('last_plc_word_swapped', 'no'),
                 'rack': 0, 'siemens_slot': 0,
                 'last_tag': request.session.get('last_plc_tag', ''),
                 'last_value': request.session.get('landing_last_plc_value'),
@@ -1819,6 +1822,15 @@ class CombinedPageView(View):
     BRIDGE_MAP_KEY = 'opcua_plc_address_map'
     BRIDGE_DTYPE_KEY = 'opcua_plc_data_type_map'
 
+    @staticmethod
+    def _normalize_word_swapped(value):
+        raw = str(value if value is not None else 'no').strip().lower()
+        return 'yes' if raw in {'1', 'true', 'yes', 'y', 'on'} else 'no'
+
+    @classmethod
+    def _word_swapped_enabled(cls, value):
+        return cls._normalize_word_swapped(value) == 'yes'
+
     @classmethod
     def _prune_bridge_snapshot(cls, session, address_map):
         snapshot = session.get(cls.BRIDGE_SNAPSHOT_KEY, {})
@@ -1928,7 +1940,7 @@ class CombinedPageView(View):
                 'ip_address': ip_address, 'slot': slot,
                 'tag': request.session.get('last_plc_tag', ''),
                 'port': request.session.get('last_plc_port'),
-                'word_swapped': request.session.get('last_plc_word_swapped', 'false'),
+                'word_swapped': request.session.get('last_plc_word_swapped', 'no'),
             },
             'opcua': {'endpoint': request.session.get('last_opcua_endpoint', '')},
             'mappings': {
@@ -1965,7 +1977,9 @@ class CombinedPageView(View):
         cleaned_dtype_map = {str(k or '').strip(): str(v or '').strip() for k, v in data_type_map.items() if str(k or '').strip()}
         port_raw = plc.get('port')
         port = int(port_raw) if port_raw is not None else None
-        word_swapped = str(plc.get('word_swapped', 'false') or 'false').strip().lower()
+        word_swapped = plc.get('word_swapped', 'no')
+        if word_swapped is None:
+            word_swapped = 'no'
         if ip_address:
             request.session['last_plc_ip'] = f'{ip_address}/{slot}'
         else:
@@ -1986,6 +2000,7 @@ class CombinedPageView(View):
         request.session['last_plc_ip'] = ''
         request.session['last_plc_brand'] = 'allen_bradley'
         request.session['last_plc_tag'] = ''
+        request.session['last_plc_word_swapped'] = 'no'
         request.session['last_opcua_endpoint'] = ''
         request.session[CombinedPageView.BRIDGE_MAP_KEY] = {}
         request.session[CombinedPageView.BRIDGE_DTYPE_KEY] = {}
@@ -2073,8 +2088,8 @@ class CombinedPageView(View):
                 request.session['last_plc_brand'] = plc_data.get('brand', 'allen_bradley')
                 if plc_data.get('port') is not None:
                     request.session['last_plc_port'] = plc_data['port']
-                if plc_data.get('word_swapped'):
-                    request.session['last_plc_word_swapped'] = plc_data['word_swapped']
+                word_swapped = plc_data.get('word_swapped', 'no')
+                request.session['last_plc_word_swapped'] = 'no' if word_swapped is None else word_swapped
 
             # Auto-restore OPC UA endpoint and discovered tags from cache
             if not request.session.get('last_opcua_endpoint') and scada_data.get('endpoint'):
@@ -2119,7 +2134,7 @@ class CombinedPageView(View):
             'plc_ip_address': ip_address, 'plc_slot': slot,
             'plc_tag': request.session.get('last_plc_tag', ''),
             'plc_port': saved_port,
-            'word_swapped': request.session.get('last_plc_word_swapped', 'false'),
+            'word_swapped': self._normalize_word_swapped(request.session.get('last_plc_word_swapped', 'no')),
         })
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
@@ -2138,6 +2153,7 @@ class CombinedPageView(View):
             'plc_brand': request.session.get('last_plc_brand', 'allen_bradley'),
             'plc_ip_address': ip_address, 'plc_slot': slot,
             'plc_tag': request.session.get('last_plc_tag', ''), 'plc_port': request.session.get('last_plc_port'),
+            'word_swapped': self._normalize_word_swapped(request.session.get('last_plc_word_swapped', 'no')),
         })
         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
@@ -2159,7 +2175,7 @@ class CombinedPageView(View):
                     operation = plc_form.cleaned_data.get('modbus_operation', 'read')
                     data_type = plc_form.cleaned_data.get('modbus_data_type', 'uint16')
                     write_value = plc_form.cleaned_data.get('modbus_write_value', '')
-                    word_swapped = str(plc_form.cleaned_data.get('word_swapped', 'false') or 'false').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                    word_swapped = self._word_swapped_enabled(plc_form.cleaned_data.get('word_swapped'))
                     plc_state, display_path = _pymodbus_service.connect_and_read(plc_ip, plc_tag, port=port, unit=1, count=1, function=function, operation=operation, data_type=data_type, write_value=write_value, word_swapped=word_swapped)
                 elif plc_brand == 'siemens_snap7':
                     _snap7_service = globals().get('_snap7_service') or Snap7Service()
@@ -2173,7 +2189,7 @@ class CombinedPageView(View):
                 request.session['last_plc_ip'] = plc_ip
                 request.session['last_plc_brand'] = plc_brand
                 request.session['last_plc_tag'] = plc_tag
-                request.session['last_plc_word_swapped'] = plc_form.cleaned_data.get('word_swapped', 'false')
+                request.session['last_plc_word_swapped'] = self._normalize_word_swapped(plc_form.cleaned_data.get('word_swapped'))
                 if plc_brand == 'pymodbus':
                     request.session['last_plc_port'] = port
                 elif plc_brand == 'siemens_snap7':
@@ -2332,6 +2348,7 @@ class CombinedPageView(View):
                         bridge['data_type_map'] = dtype_map
                         bridge['mapped_count'] = len(address_map)
                         bridge['last_sync_status_map'] = status_map
+                        payload.setdefault('plc', {})['word_swapped'] = request.session.get('last_plc_word_swapped', 'no')
                         # IMPORTANT:
                         # Keep the last cached PLC/scada snapshot across OPC-UA disconnects.
                         # If we overwrite with an empty snapshot during (re)activation,
@@ -2433,7 +2450,7 @@ class CombinedPageView(View):
                             'plc_slot': slot,
                             'plc_tag': request.session.get('last_plc_tag', ''),
                             'plc_port': request.session.get('last_plc_port'),
-                            'word_swapped': request.session.get('last_plc_word_swapped', 'false'),
+                            'word_swapped': self._normalize_word_swapped(request.session.get('last_plc_word_swapped', 'no')),
                         })
 
                         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
@@ -2456,6 +2473,7 @@ class CombinedPageView(View):
                                 bridge['mapped_count'] = len(address_map)
                                 bridge['last_sync_status_map'] = {}
                                 bridge['last_sync_snapshot'] = {}
+                                data.setdefault('plc', {})['word_swapped'] = request.session.get('last_plc_word_swapped', 'no')
                                 data['runtime'] = {
                                     'last_action': 'auto_bridge_from_load',
                                     'last_message': f'Bridge auto-activated for {len(address_map)} mapped address(es).',
@@ -2495,7 +2513,7 @@ class CombinedPageView(View):
                             'plc_slot': slot,
                             'plc_tag': request.session.get('last_plc_tag', ''),
                             'plc_port': request.session.get('last_plc_port'),
-                            'word_swapped': request.session.get('last_plc_word_swapped', 'false'),
+                            'word_swapped': self._normalize_word_swapped(request.session.get('last_plc_word_swapped', 'no')),
                         })
 
                         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))

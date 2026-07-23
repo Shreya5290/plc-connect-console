@@ -1,6 +1,6 @@
 @echo off
 REM Click2Connect Portable Launcher
-REM Starts the Django development server and opens browser
+REM Starts the Django development server
 
 echo.
 echo =========================================================
@@ -17,11 +17,10 @@ timeout /t 2 /nobreak > nul
 
 REM Start the server on localhost:8000
 echo [Server] Starting Click2Connect...
-echo [Server] Opening http://localhost:8000 in browser...
+echo [Server] UI available at http://localhost:8000
 echo.
 
-REM Open browser and start server
-start http://localhost:8000
+REM Start server. Open http://localhost:8000 manually if needed.
 python manage.py runserver 0.0.0.0:8000
 
 echo.

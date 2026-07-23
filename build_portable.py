@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DIST_DIR = BASE_DIR / "dist_portable"
 BUILD_DIR = BASE_DIR / "build_portable"
 VERSION = (BASE_DIR / "version.txt").read_text().strip()
+EXE_NAME = f"Click2Connect_{VERSION}"
 
 print(f"\n{'='*60}")
 print(f"  Click2Connect {VERSION} - ONEFILE Build")
@@ -79,7 +80,7 @@ if (BASE_DIR / "db.sqlite3").exists():
     db_data_entry = "        ('db.sqlite3', '.'),\r\n"
 
 # Important fix: start the Django server explicitly via server_entrypoint.py
-spec_content = f'''# -*- mode: python ; coding: utf-8 -*-\r\n\r\na = Analysis(\r\n    ['server_entrypoint.py'],\r\n    pathex=[],\r\n    binaries=[],\r\n    datas=[\r\n        ('connectapp/templates', 'connectapp/templates'),\r\n        ('connectapp/migrations', 'connectapp/migrations'),\r\n        ('cache', 'cache'),\r\n        ('logs', 'logs'),\r\n        ('version.txt', '.'),\r\n{db_data_entry}    ],\r\n    hiddenimports=[\r\n        'django',\r\n        'django.conf',\r\n        'django.core',\r\n        'django.core.management',\r\n        'django.core.management.commands.runserver',\r\n        'django.db',\r\n        'django.db.backends.sqlite3',\r\n        'django.contrib.admin',\r\n        'django.contrib.auth',\r\n        'django.contrib.contenttypes',\r\n        'django.contrib.sessions',\r\n        'django.contrib.messages',\r\n        'django.contrib.staticfiles',\r\n        'connectapp',\r\n        'connectapp.views',\r\n        'connectapp.forms',\r\n        'connectapp.urls',\r\n        'pycomm3',\r\n        'pymodbus',\r\n        'snap7',\r\n        'opcua',\r\n        'asyncio',\r\n        'threading',\r\n        'json',\r\n        'yaml',\r\n    ],\r\n    hookspath=[],\r\n    runtime_hooks=[],\r\n    excludedimports=[],\r\n    noarchive=False,\r\n)\r\n\r\npyz = PYZ(a.pure)\r\n\r\nexe = EXE(\r\n    pyz,\r\n    a.scripts,\r\n    a.binaries,\r\n    a.zipfiles,\r\n    a.datas,\r\n    [],\r\n    name='Click2Connect_v{VERSION}',\r\n    debug=False,\r\n    bootloader_ignore_signals=False,\r\n    strip=False,\r\n    upx=False,\r\n    console=True,\r\n    disable_windowed_traceback=False,\r\n    icon=['click2connect_icon.ico'],\r\n)\r\n'''
+spec_content = f'''# -*- mode: python ; coding: utf-8 -*-\r\n\r\na = Analysis(\r\n    ['server_entrypoint.py'],\r\n    pathex=[],\r\n    binaries=[],\r\n    datas=[\r\n        ('connectapp/templates', 'connectapp/templates'),\r\n        ('connectapp/migrations', 'connectapp/migrations'),\r\n        ('cache', 'cache'),\r\n        ('logs', 'logs'),\r\n        ('version.txt', '.'),\r\n{db_data_entry}    ],\r\n    hiddenimports=[\r\n        'django',\r\n        'django.conf',\r\n        'django.core',\r\n        'django.core.management',\r\n        'django.core.management.commands.runserver',\r\n        'django.db',\r\n        'django.db.backends.sqlite3',\r\n        'django.contrib.admin',\r\n        'django.contrib.auth',\r\n        'django.contrib.contenttypes',\r\n        'django.contrib.sessions',\r\n        'django.contrib.messages',\r\n        'django.contrib.staticfiles',\r\n        'connectapp',\r\n        'connectapp.views',\r\n        'connectapp.forms',\r\n        'connectapp.urls',\r\n        'pycomm3',\r\n        'pymodbus',\r\n        'snap7',\r\n        'opcua',\r\n        'asyncio',\r\n        'threading',\r\n        'json',\r\n        'yaml',\r\n    ],\r\n    hookspath=[],\r\n    runtime_hooks=[],\r\n    excludedimports=[],\r\n    noarchive=False,\r\n)\r\n\r\npyz = PYZ(a.pure)\r\n\r\nexe = EXE(\r\n    pyz,\r\n    a.scripts,\r\n    a.binaries,\r\n    a.zipfiles,\r\n    a.datas,\r\n    [],\r\n    name='{EXE_NAME}',\r\n    debug=False,\r\n    bootloader_ignore_signals=False,\r\n    strip=False,\r\n    upx=False,\r\n    console=True,\r\n    disable_windowed_traceback=False,\r\n    icon=['click2connect_icon.ico'],\r\n)\r\n'''
 
 spec_file = BASE_DIR / f"Click2Connect_{VERSION}_portable.spec"
 spec_file.write_text(spec_content, encoding="utf-8")
@@ -87,7 +88,7 @@ spec_file.write_text(spec_content, encoding="utf-8")
 print(f"  ✓ {spec_file.name}")
 
 print("\n[Build] Compiling ONEFILE executable...")
-print(f"  Building: Click2Connect_{VERSION}.exe\n")
+print(f"  Building: {EXE_NAME}.exe\n")
 
 import PyInstaller.__main__
 
@@ -103,7 +104,7 @@ PyInstaller.__main__.run(
 )
 
 # Expected output for onefile build
-exe_path = DIST_DIR / f"Click2Connect_{VERSION}.exe"
+exe_path = DIST_DIR / f"{EXE_NAME}.exe"
 
 if exe_path.exists():
     print(f"\n{'='*60}")
@@ -118,7 +119,7 @@ if exe_path.exists():
     print("   2. Send it to the target PC")
     print("   3. Double-click the EXE")
     print("   4. Wait a few seconds for startup")
-    print("   5. Browser opens to http://localhost:8000\n")
+    print("   5. Open http://localhost:8000 manually if needed\n")
 
     print("✅ Single-file EXE")
     print("✅ No _internal folder")
