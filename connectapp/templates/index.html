@@ -1540,8 +1540,19 @@
         // Intercept form submission for remove_selected_tags to remove excess fields
         if (removeSelectedForm) {
           removeSelectedForm.addEventListener('submit', function(e) {
-            var actionField = removeSelectedForm.querySelector('input[name="action"]');
-            if (actionField && actionField.value === 'remove_selected_tags') {
+            // This form is shared by "Connect & Start Sync", "Refresh Sync" and
+            // the "Remove Selected" button. The mapping fields (node_ids /
+            // plc_addresses / data_types) must ONLY be pruned for the actual
+            // remove-selected submit; otherwise a Connect submit would strip the
+            // addresses the user just typed and the server would report
+            // "Map at least one PLC address".
+            //
+            // Connect/Refresh buttons carry name="action"; the remove-selected
+            // confirm button does not, so it falls back to the form's hidden
+            // action field (remove_selected_tags).
+            var submitter = e.submitter;
+            var isRemoveSelected = !!submitter && submitter.name !== 'action';
+            if (isRemoveSelected) {
               // Remove all node_ids, plc_addresses, data_types hidden fields to reduce POST field count
               var fieldsToRemove = removeSelectedForm.querySelectorAll('input[name="node_ids"], input[name="plc_addresses"], select[name="data_types"]');
               fieldsToRemove.forEach(function(field) {

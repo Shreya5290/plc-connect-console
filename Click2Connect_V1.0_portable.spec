@@ -10,7 +10,6 @@ a = Analysis(
         ('cache', 'cache'),
         ('logs', 'logs'),
         ('version.txt', '.'),
-        ('db.sqlite3', '.'),
     ],
     hiddenimports=[
         'django',

@@ -221,26 +221,46 @@ class PymodbusService:
         return 1
 
     @staticmethod
+    def _apply_word_swap(registers, data_type, word_swapped):
+        """Apply 16-bit word swapping for multi-register types when enabled.
+
+        Covers floats AND 32/64-bit integers (DINT/UDINT/LINT/ULINT), so the
+        word order matches devices/tools like ModScan that store the low word
+        first.
+        - 32-bit (2 words): swap the two words
+        - 64-bit (4 words): swap within each pair (word order 1-0-3-2)
+        """
+        if not word_swapped:
+            return registers
+        registers = list(registers)
+        if data_type in ('uint32', 'int32', 'float32') and len(registers) >= 2:
+            registers[0], registers[1] = registers[1], registers[0]
+        elif data_type in ('uint64', 'int64', 'float64') and len(registers) >= 4:
+            registers[0], registers[1], registers[2], registers[3] = (
+                registers[1], registers[0], registers[3], registers[2]
+            )
+        return registers
+
+    @staticmethod
     def _decode_registers(registers, data_type, debug_info=None, word_swapped=False):
         if not registers:
             return None
         registers = [int(r) for r in registers]
+
+        # Optional 16-bit word swapping for every multi-register type (floats AND
+        # 32/64-bit integers such as DINT/UDINT/LINT). Many Modbus devices and
+        # PLCs (e.g. Allen-Bradley) store the low word first; ModScan lets you
+        # pick this word order, so we must honour it here too, otherwise DINT and
+        # other multi-word values decode incorrectly.
+        registers = PymodbusService._apply_word_swap(registers, data_type, word_swapped)
+
         first = registers[0]
 
-        # Optional 16-bit word swapping for floats.
-        # - float32: swap the two 16-bit words
-        # - float64: swap the four 16-bit words in pairs (word order: 1-0-3-2)
         if data_type == 'float32':
-            w0, w1 = registers[0], registers[1]
-            if word_swapped:
-                w0, w1 = w1, w0
-            return struct.unpack('>f', struct.pack('>HH', w0, w1))[0]
+            return struct.unpack('>f', struct.pack('>HH', registers[0], registers[1]))[0]
 
         if data_type == 'float64':
-            w0, w1, w2, w3 = registers[0], registers[1], registers[2], registers[3]
-            if word_swapped:
-                w0, w1, w2, w3 = w1, w0, w3, w2
-            return struct.unpack('>d', struct.pack('>HHHH', w0, w1, w2, w3))[0]
+            return struct.unpack('>d', struct.pack('>HHHH', registers[0], registers[1], registers[2], registers[3]))[0]
 
         if data_type == 'int16':
             return first - 0x10000 if first & 0x8000 else first
@@ -254,8 +274,6 @@ class PymodbusService:
         if data_type == 'int64':
             value = (int(registers[0]) << 48) | (int(registers[1]) << 32) | (int(registers[2]) << 16) | int(registers[3])
             return value - (1 << 64) if value & (1 << 63) else value
-        if data_type == 'float64':
-            return struct.unpack('>d', struct.pack('>HHHH', int(registers[0]), int(registers[1]), int(registers[2]), int(registers[3])))[0]
         if data_type == 'bool':
             return bool(first)
         if data_type == 'string':
@@ -332,6 +350,7 @@ class PymodbusService:
         data_type='uint16',
         write_value='',
         string_length=10,
+        word_swapped=False,
     ):
         state = ViewState(tag_name=tag_name)
         host, display = self._parse_host(ip)
@@ -389,6 +408,7 @@ class PymodbusService:
                             state.message = f'Connected to Modbus PLC at {display}'
                     elif func in ('holding', 'reg', 'register'):
                         registers = self._encode_registers(write_value, data_type)
+                        registers = self._apply_word_swap(registers, data_type, word_swapped)
                         if len(registers) == 1:
                             result = client.write_register(addr, registers[0], device_id=int(unit))
                         else:
@@ -410,7 +430,7 @@ class PymodbusService:
                             state.message = f'Read failed for holding register {address_label}: {error_msg}' if error_msg else f'Read failed for holding register {address_label}'
                         else:
                             regs = getattr(result, 'registers', []) or []
-                            state.tag_value = self._decode_registers(regs, data_type)
+                            state.tag_value = self._decode_registers(regs, data_type, word_swapped=word_swapped)
                             state.tag_status = f'Holding register {address_label} read as {data_type.upper()} at offset {addr}'
                             state.message = f'Connected to Modbus PLC at {display}'
                     except Exception as exc:
@@ -436,7 +456,7 @@ class PymodbusService:
                             state.message = f'Read failed for input register {address_label}: {error_msg}' if error_msg else f'Read failed for input register {address_label}'
                         else:
                             regs = getattr(result, 'registers', []) or []
-                            state.tag_value = self._decode_registers(regs, data_type)
+                            state.tag_value = self._decode_registers(regs, data_type, word_swapped=word_swapped)
                             state.tag_status = f'Input register {address_label} read as {data_type.upper()} at offset {addr}'
                             state.message = f'Connected to Modbus PLC at {display}'
                     except Exception as exc:
@@ -804,15 +824,21 @@ _RECENT_BACKUP_FILE = _LANDING_BACKUP_DIR / 'recent_backup.json'
 
 # Load version from version.txt
 def _load_app_version():
-    """Load version from version.txt file."""
+    """Load version from version.txt, normalized without a leading 'v'/'V'.
+
+    The UI template already prefixes the value with 'v', so a version.txt of
+    'V1.0', 'v1.0' or '1.0' all render consistently as 'v1.0'.
+    """
     version_file = Path(settings.BASE_DIR) / 'version.txt'
+    raw = ''
     try:
         if version_file.exists():
-            return version_file.read_text(encoding='utf-8').strip()
+            raw = version_file.read_text(encoding='utf-8').strip()
     except Exception as e:
         print(f'Warning: Could not load version: {e}')
-    # If file was replaced with a semantic version like "V1.0", keep it as-is.
-    return version_file.read_text(encoding='utf-8').strip() if version_file.exists() else 'V1.0'
+    if not raw:
+        raw = '1.0'
+    return raw.lstrip('vV').strip()
 
 APP_VERSION = _load_app_version()
 
@@ -1186,6 +1212,10 @@ class AsyncBridgeService:
         # Increment when we transition from "not connected" -> "connected" (reconnect detection).
         bridge.setdefault('opcua_connected', False)
         bridge.setdefault('opcua_reconnect_epoch', 0)
+        # Sticky recovery state: while True, the PLC drives SCADA and SCADA->PLC
+        # writes are suppressed until SCADA converges after a reconnect.
+        bridge.setdefault('opcua_reconnect_recovering', False)
+        bridge.setdefault('opcua_reconnect_recovery_cycles', 0)
 
         if not bridge.get('active'):
             return
@@ -1269,9 +1299,64 @@ class AsyncBridgeService:
                 raise ConnectionError(f'OPC UA connection is not responsive: {e}') from e
 
             now_connected = True
-            if now_connected and not was_connected:
+
+            # Reliable SCADA-restart detection.
+            #
+            # The bridge opens a fresh OPC UA connection every cycle, so a brief
+            # SCADA restart between two polls can go unnoticed if no cycle happens
+            # to catch the socket down (opcua_connected stays True). When that
+            # happens the server comes back reporting initial/default values
+            # (e.g. 0) that would otherwise be mistaken for an operator write and
+            # pushed to the PLC, destroying setpoints. To catch every restart we
+            # also compare the server's ServerStatus StartTime, which changes on
+            # each server start.
+            server_restarted = False
+            server_start_time = None
+            try:
+                # ns=0;i=2257 == Server_ServerStatus_StartTime
+                server_start_time = opcua_client.get_node(
+                    ua.NodeId(2257, 0)
+                ).get_value()
+                if server_start_time is not None:
+                    server_start_key = str(server_start_time)
+                    previous_start_key = bridge.get('opcua_server_start_time')
+                    if previous_start_key and previous_start_key != server_start_key:
+                        server_restarted = True
+                    bridge['opcua_server_start_time'] = server_start_key
+            except Exception:
+                # Server does not expose StartTime (or read failed) -> fall back
+                # to the connection-transition heuristic only.
+                pass
+
+            if (now_connected and not was_connected) or server_restarted:
                 bridge['opcua_reconnect_epoch'] = int(bridge.get('opcua_reconnect_epoch', 0)) + 1
+                # Enter reconnect-recovery mode. The PLC retains the values that
+                # were written before the disconnect, so it becomes the source of
+                # truth until SCADA has caught up again (see below).
+                bridge['opcua_reconnect_recovering'] = True
+                bridge['opcua_reconnect_recovery_cycles'] = 0
             bridge['opcua_connected'] = True
+
+            # Reconnect-recovery mode.
+            #
+            # After a SCADA restart the OPC UA nodes report initial/default
+            # values (e.g. 0), and the SCADA application may keep re-writing those
+            # defaults for several cycles while it initialises. A single restore
+            # is therefore not enough: the reset value would be picked up as a
+            # genuine "SCADA changed" event on a later cycle and pushed to the
+            # PLC, destroying setpoints.
+            #
+            # While recovering we treat the PLC as authoritative: PLC values are
+            # driven to SCADA (exactly like the initial bootstrap) and SCADA ->
+            # PLC writes are suppressed. Recovery ends once SCADA has converged to
+            # the PLC values for a full cycle, or after a safety cap of cycles.
+            recovering = (
+                not force_plc_to_scada
+                and bool(bridge.get('opcua_reconnect_recovering', False))
+            )
+            effective_force = force_plc_to_scada or recovering
+            recovery_mismatch = 0
+            RECOVERY_MAX_CYCLES = 60
 
             if is_siemens:
                 _snap7_service = globals().get('_snap7_service')
@@ -1302,53 +1387,18 @@ class AsyncBridgeService:
                             node = opcua_client.get_node(node_id)
                             variant_type = node.get_data_type_as_variant_type()
                             scada_value = node.get_value()
-                            initial_scada_value = scada_value
 
                             snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                             has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
 
-                            # Reconnect-safe restore:
-                            # OPC UA nodes may report reconnect-initial/default values (e.g. 0) immediately
-                            # after a reconnect. In that case we must NOT poison bridge['last_sync_snapshot']
-                            # with those reconnect-default SCADA values.
-                            cached_scada_value = snapshot.get('scada_value') if has_snapshot else None
-                            scada_is_cached_default = (
-                                cached_scada_value is not None
-                                and self._values_match(initial_scada_value, cached_scada_value)
-                            )
+                            # During reconnect-recovery the PLC drives SCADA. A node is
+                            # "still resetting" while SCADA does not echo the value we last
+                            # wrote (i.e. it keeps overriding with initial/defaults). Count
+                            # those so we know when SCADA has settled and recovery can end.
+                            if recovering and has_snapshot and not self._values_match(scada_value, snapshot.get('scada_value')):
+                                recovery_mismatch += 1
 
-                            # NOTE: we intentionally avoid hardcoding "0.0"/"0" heuristics for PLC.
-                            # The only safe decision we make here is to protect the cached SCADA value.
-                            # Prevent infinite restore-loop (Snap7 parity with Modbus path)
-                            restore_consumed = bool(snapshot.get('opcua_reconnect_restore_consumed', False)) if isinstance(snapshot, dict) else False
-
-                            if (
-                                force_plc_to_scada is False
-                                and has_snapshot
-                                and scada_is_cached_default
-                                and not restore_consumed
-                            ):
-                                # SCADA appears to be the reconnect-initial/default state -> restore SCADA from cache.
-                                plc_value = snapshot.get('plc_value')
-                                scada_value = cached_scada_value
-                                typed_value = self._coerce_for_variant(scada_value, variant_type)
-                                try:
-                                    node.set_value(typed_value, variant_type)
-                                    success_count += 1
-                                except Exception:
-                                    pass
-                                current_epoch = int(bridge.get('opcua_reconnect_epoch', 0))
-                                status_map[node_id] = f'Restored SCADA from cache after OPC UA reconnect for {address_label} (epoch {current_epoch}).'
-                                snapshot_map[node_id] = {
-                                    'plc_tag': original_tag,
-                                    'plc_value': plc_value,
-                                    'scada_value': scada_value,
-                                    'synced_at': timezone.localtime().isoformat(),
-                                    'opcua_reconnect_restore_consumed': True,
-                                    'opcua_reconnect_restore_epoch': current_epoch,
-                                }
-                                continue
-                            if force_plc_to_scada or not has_snapshot:
+                            if effective_force or not has_snapshot:
                                 # If SCADA restarted after being disturbed, it may temporarily contain
                                 # initial/default values. When bridge cache has a last snapshot for this node,
                                 # restore SCADA from the cached PLC-known value.
@@ -1477,72 +1527,15 @@ class AsyncBridgeService:
                             scada_value = node.get_value()
                             snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                             has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
-                            # Reconnect-safe restore for Modbus:
-                            # If OPC UA just reconnected and reports cached-default SCADA values,
-                            # do not overwrite snapshot with PLC values.
-                            cached_scada_value = snapshot.get('scada_value') if has_snapshot else None
-                            scada_is_cached_default = (
-                                has_snapshot
-                                and cached_scada_value is not None
-                                and self._values_match(scada_value, cached_scada_value)
-                            )
 
-                            # Reconnect-safe restore: only restore once per OPC UA reconnect epoch.
-                            current_epoch = int(bridge.get('opcua_reconnect_epoch', 0))
-                            snapshot_epoch = None
-                            if isinstance(snapshot, dict):
-                                snapshot_epoch = snapshot.get('opcua_reconnect_restore_epoch')
-                            restore_already_for_epoch = (snapshot_epoch is not None and int(snapshot_epoch) == current_epoch)
+                            # During reconnect-recovery the PLC drives SCADA. A node is
+                            # "still resetting" while SCADA does not echo the value we last
+                            # wrote (i.e. it keeps overriding with initial/defaults). Count
+                            # those so we know when SCADA has settled and recovery can end.
+                            if recovering and has_snapshot and not self._values_match(scada_value, snapshot.get('scada_value')):
+                                recovery_mismatch += 1
 
-                            if (
-                                has_snapshot
-                                and (force_plc_to_scada is False)
-                                and scada_is_cached_default
-                                and (not restore_already_for_epoch)
-                            ):
-
-                                # Debug log (one line per decision) for reconnect restore logic
-                                try:
-                                    _log_path = Path(settings.BASE_DIR) / 'logs' / 'bridge_debug.jsonl'
-                                    _log_path.parent.mkdir(parents=True, exist_ok=True)
-                                    with _log_path.open('a', encoding='utf-8') as _f:
-                                        _f.write(json.dumps({
-                                            'at': timezone.localtime().isoformat(),
-                                            'node_id': node_id,
-                                            'address_label': address_label,
-                                            'event': 'restore_from_cache_modbus',
-                                            'opcua_reconnect_epoch': current_epoch,
-                                            'opcua_reconnect_restore_epoch_before': snapshot_epoch,
-                                            'scada_is_cached_default': scada_is_cached_default,
-                                            'force_plc_to_scada': force_plc_to_scada,
-                                            'plc_value_before': plc_value,
-                                            'scada_value_before': scada_value,
-                                        }, ensure_ascii=False) + '\n')
-                                except Exception:
-                                    pass
-
-                                # Restore SCADA from cache
-
-                                plc_value = snapshot.get('plc_value')
-                                scada_value = cached_scada_value
-                                typed_value = self._coerce_for_variant(scada_value, variant_type)
-                                try:
-                                    node.set_value(typed_value, variant_type)
-                                    success_count += 1
-                                except Exception:
-                                    pass
-                                status_map[node_id] = f'Restored SCADA from cache after OPC UA reconnect for {address_label}.'
-                                snapshot_map[node_id] = {
-                                    'plc_tag': original_tag,
-                                    'plc_value': plc_value,
-                                    'scada_value': scada_value,
-                                    'synced_at': timezone.localtime().isoformat(),
-                                    'opcua_reconnect_restore_consumed': True,
-                                    'opcua_reconnect_restore_epoch': current_epoch,
-                                }
-                                continue
-
-                            if force_plc_to_scada or not has_snapshot:
+                            if effective_force or not has_snapshot:
                                 if not self._values_match(plc_value, scada_value):
                                     typed_value = self._coerce_for_variant(plc_value, variant_type)
                                     node.set_value(typed_value, variant_type)
@@ -1569,14 +1562,9 @@ class AsyncBridgeService:
                                         word_swapped = str(payload.get('plc', {}).get('word_swapped', 'false') or 'false').strip().lower() in ('1','true','yes','y','on')
                                         registers = PymodbusService._encode_registers(scada_value, tag_dtype)
 
-                                        # Respect Modbus word swapping for float types during SCADA -> PLC writes.
-                                        word_swapped = str(payload.get('plc', {}).get('word_swapped', 'false') or 'false').strip().lower() in ('1','true','yes','y','on')
-                                        if word_swapped:
-                                            if tag_dtype == 'float32' and len(registers) >= 2:
-                                                registers[0], registers[1] = registers[1], registers[0]
-                                            elif tag_dtype == 'float64' and len(registers) >= 4:
-                                                # float64 is 4 registers: swap pairs (w0,w1,w2,w3 -> w1,w0,w3,w2)
-                                                registers[0], registers[1], registers[2], registers[3] = registers[1], registers[0], registers[3], registers[2]
+                                        # Respect Modbus word swapping for all multi-register
+                                        # types (floats AND 32/64-bit integers like DINT).
+                                        registers = PymodbusService._apply_word_swap(registers, tag_dtype, word_swapped)
 
                                         if func == 'coil':
                                             modbus_client.write_coil(addr, bool(scada_value), device_id=1)
@@ -1602,14 +1590,10 @@ class AsyncBridgeService:
                                             tag_dtype = data_type_map.get(node_id, 'uint16')
                                             registers = PymodbusService._encode_registers(scada_value, tag_dtype)
 
-                                            # Respect Modbus word swapping for float types during SCADA -> PLC writes.
+                                            # Respect Modbus word swapping for all multi-register
+                                            # types (floats AND 32/64-bit integers like DINT).
                                             word_swapped = str(payload.get('plc', {}).get('word_swapped', 'false') or 'false').strip().lower() in ('1','true','yes','y','on')
-                                            if word_swapped:
-                                                if tag_dtype == 'float32' and len(registers) >= 2:
-                                                    registers[0], registers[1] = registers[1], registers[0]
-                                                elif tag_dtype == 'float64' and len(registers) >= 4:
-                                                    # float64 is 4 registers: swap pairs (w0,w1,w2,w3 -> w1,w0,w3,w2)
-                                                    registers[0], registers[1], registers[2], registers[3] = registers[1], registers[0], registers[3], registers[2]
+                                            registers = PymodbusService._apply_word_swap(registers, tag_dtype, word_swapped)
 
                                             if func == 'coil':
                                                 modbus_client.write_coil(addr, bool(scada_value), device_id=1)
@@ -1628,20 +1612,11 @@ class AsyncBridgeService:
                                     aligned_count += 1
                                     status_map[node_id] = f'Value: {plc_value}'
 
-                            # Preserve reconnect-restore markers so the epoch guard survives subsequent cycles.
-                            restore_epoch = snapshot.get('opcua_reconnect_restore_epoch') if isinstance(snapshot, dict) else None
-                            restore_consumed = snapshot.get('opcua_reconnect_restore_consumed') if isinstance(snapshot, dict) else None
                             snapshot_map[node_id] = {
                                 'plc_tag': original_tag,
                                 'plc_value': plc_value,
                                 'scada_value': scada_value,
                                 'synced_at': timezone.localtime().isoformat(),
-                                **({
-                                    'opcua_reconnect_restore_epoch': restore_epoch
-                                } if restore_epoch is not None else {}),
-                                **({
-                                    'opcua_reconnect_restore_consumed': restore_consumed
-                                } if restore_consumed is not None else {}),
                             }
                         except Exception as exc:
                             status_map[node_id] = f'Sync failed: {exc}'
@@ -1673,7 +1648,15 @@ class AsyncBridgeService:
                         scada_value = node.get_value()
                         snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                         has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
-                        if force_plc_to_scada or not has_snapshot:
+
+                        # During reconnect-recovery the PLC drives SCADA. A node is
+                        # "still resetting" while SCADA does not echo the value we last
+                        # wrote (i.e. it keeps overriding with initial/defaults). Count
+                        # those so we know when SCADA has settled and recovery can end.
+                        if recovering and has_snapshot and not self._values_match(scada_value, snapshot.get('scada_value')):
+                            recovery_mismatch += 1
+
+                        if effective_force or not has_snapshot:
                             if not self._values_match(plc_value, scada_value):
                                 typed_value = self._coerce_for_variant(plc_value, variant_type)
                                 node.set_value(typed_value, variant_type)
@@ -1731,6 +1714,15 @@ class AsyncBridgeService:
             bridge['last_sync_result'] = (f'Bridge cycle: {success_count} updates, {aligned_count} aligned, {conflict_count} conflicts, {failed_count} failures.')
             bridge['last_sync_status_map'] = status_map
             bridge['last_sync_snapshot'] = snapshot_map
+            # End reconnect-recovery once SCADA has converged to the PLC values
+            # for a full cycle (no mismatches), or after a safety cap so a node
+            # that can never be written does not keep the bridge stuck in
+            # recovery (which would suppress SCADA -> PLC writes indefinitely).
+            if recovering:
+                cycles = int(bridge.get('opcua_reconnect_recovery_cycles', 0)) + 1
+                bridge['opcua_reconnect_recovery_cycles'] = cycles
+                if recovery_mismatch == 0 or cycles >= RECOVERY_MAX_CYCLES:
+                    bridge['opcua_reconnect_recovering'] = False
             payload['runtime'] = {'last_action': 'bridge_monitor_cycle', 'last_message': bridge['last_sync_result']}
         except Exception as exc:
             error_type = type(exc).__name__
@@ -2167,7 +2159,8 @@ class CombinedPageView(View):
                     operation = plc_form.cleaned_data.get('modbus_operation', 'read')
                     data_type = plc_form.cleaned_data.get('modbus_data_type', 'uint16')
                     write_value = plc_form.cleaned_data.get('modbus_write_value', '')
-                    plc_state, display_path = _pymodbus_service.connect_and_read(plc_ip, plc_tag, port=port, unit=1, count=1, function=function, operation=operation, data_type=data_type, write_value=write_value)
+                    word_swapped = str(plc_form.cleaned_data.get('word_swapped', 'false') or 'false').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                    plc_state, display_path = _pymodbus_service.connect_and_read(plc_ip, plc_tag, port=port, unit=1, count=1, function=function, operation=operation, data_type=data_type, write_value=write_value, word_swapped=word_swapped)
                 elif plc_brand == 'siemens_snap7':
                     _snap7_service = globals().get('_snap7_service') or Snap7Service()
                     globals()['_snap7_service'] = _snap7_service
