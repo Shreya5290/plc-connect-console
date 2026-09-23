@@ -10,8 +10,9 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-from pathlib import Path
+import os
 import sys
+from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 #
@@ -23,11 +24,7 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).resolve().parent
     # Also force the working directory to the stable portable folder.
     # This ensures that relative paths (and os.getcwd()) stay consistent.
-    try:
-        import os
-        os.chdir(BASE_DIR)
-    except Exception:
-        pass
+    os.chdir(BASE_DIR)
 else:
     BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -42,7 +39,11 @@ SECRET_KEY = 'django-insecure-bh98)@ra+oss60deg*yt1x$wnl7%a!pcmqq3e63)9yf#b6p2t8
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# Hide runserver's "development server / not for production" banner. This is a
+# local single-user tool started via runserver, so the warning is noise.
+os.environ.setdefault('DJANGO_RUNSERVER_HIDE_WARNING', 'true')
+
+ALLOWED_HOSTS: list[str] = []
 
 
 # Application definition

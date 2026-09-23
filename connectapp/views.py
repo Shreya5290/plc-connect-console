@@ -1032,6 +1032,18 @@ class AsyncBridgeService:
         self._plc_connection_errors = {}  # Track errors per PLC address
         self._opcua_connection_errors = {}  # Track errors per endpoint
         self._error_backoff_multiplier = 1  # Start normal speed
+        # Persistent OPC UA connection reused across cycles. Reconnecting on
+        # every poll is the dominant tag-update latency over a VPN, so the client
+        # is kept open and only rebuilt when the endpoint changes or drops.
+        self._opcua_client = None
+        self._opcua_endpoint = None
+        # Base cycle delay, refreshed from the configured poll interval each cycle.
+        self._current_poll_interval = 1.0
+        # SCADA-shutdown recovery (auto disconnect/reconnect of OPC UA).
+        self._opcua_unresponsive_since = None
+        self._opcua_reconnect_attempts = 0
+        self._opcua_unresponsive_grace_seconds = 60  # wait 1 min before reconnecting
+        self._opcua_reconnect_limit = 10  # give up after 10 attempts
 
     @staticmethod
     def _values_match(left, right):
@@ -1113,7 +1125,97 @@ class AsyncBridgeService:
                 self._thread.join(timeout=5)
                 if self._thread.is_alive():
                     print('[Bridge] WARNING: Bridge thread did not stop cleanly (will be terminated)')
+            self._disconnect_opcua()
             print('[Bridge] Shutdown complete')
+
+    def _disconnect_opcua(self):
+        """Tear down the persistent OPC UA client so the next cycle reconnects."""
+        client = self._opcua_client
+        self._opcua_client = None
+        self._opcua_endpoint = None
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+    def _ensure_opcua_client(self, endpoint):
+        """Return a connected OPC UA client, reusing the persistent connection.
+
+        Re-opening a full OPC UA session (hello/open-channel/create/activate)
+        every poll is the main reason tag updates feel slow over a VPN, where
+        each round trip is expensive. Keeping one session open across cycles
+        removes that per-cycle handshake cost.
+        """
+        if self._opcua_client is not None and self._opcua_endpoint == endpoint:
+            return self._opcua_client
+        # Endpoint changed or no client yet: drop any stale client and reconnect.
+        self._disconnect_opcua()
+        client = OpcUaClient(endpoint, timeout=4)
+        client.connect()
+        self._opcua_client = client
+        self._opcua_endpoint = endpoint
+        return client
+
+    def _note_opcua_healthy(self):
+        """Reset SCADA-recovery counters after a successful cycle."""
+        self._opcua_unresponsive_since = None
+        self._opcua_reconnect_attempts = 0
+
+    def _handle_opcua_unresponsive(self):
+        """Drive automatic reconnect/recovery when OPC UA stops responding.
+
+        Behaviour requested for SCADA shutdown handling:
+        - Tolerate short outages; only act after ~1 minute unresponsive.
+        - Then disconnect and reconnect, retrying up to 10 times.
+        - After 10 failed attempts, surface a clear "could not connect" message
+          without closing the application.
+        Returns True while still recovering, False once the attempt limit is hit.
+        """
+        now = perf_counter()
+        if self._opcua_unresponsive_since is None:
+            self._opcua_unresponsive_since = now
+            return True
+
+        unresponsive_for = now - self._opcua_unresponsive_since
+        if unresponsive_for < self._opcua_unresponsive_grace_seconds:
+            return True
+
+        if self._opcua_reconnect_attempts < self._opcua_reconnect_limit:
+            self._opcua_reconnect_attempts += 1
+            print(
+                f'[Bridge] OPC UA unresponsive for {unresponsive_for:.0f}s; '
+                f'reconnect attempt {self._opcua_reconnect_attempts}/{self._opcua_reconnect_limit}'
+            )
+            # Force a fresh session on the next cycle.
+            self._disconnect_opcua()
+            return True
+
+        self._report_opcua_unreachable()
+        return False
+
+    def _report_opcua_unreachable(self):
+        """Publish a user-facing failure message to the bridge status store."""
+        message = (
+            'Connection could not be established: OPC UA server did not respond '
+            f'after {self._opcua_reconnect_limit} reconnect attempts.'
+        )
+
+        def mutate(payload):
+            bridge = payload.setdefault('bridge', {})
+            bridge['last_sync_result'] = message
+            bridge['opcua_connected'] = False
+            bridge['last_sync_at'] = timezone.localtime().isoformat()
+            status_map = bridge.get('last_sync_status_map') or {}
+            address_map = bridge.get('node_address_map') or {}
+            for node_id in address_map:
+                status_map[node_id] = 'Connection could not be established.'
+            bridge['last_sync_status_map'] = status_map
+
+        try:
+            self.store.update(mutate)
+        except Exception as exc:
+            print(f'[Bridge] Failed to publish unreachable status: {exc}')
 
     def _thread_main(self):
         loop = asyncio.new_event_loop()
@@ -1128,7 +1230,9 @@ class AsyncBridgeService:
         import random
         while not self._stop_event.is_set():
             self._cycle_count += 1
-            cycle_delay = 1.0
+            # Honor the operator-configured poll interval instead of a fixed 1s.
+            # A missing/invalid value falls back to a safe default.
+            cycle_delay = self._current_poll_interval
             try:
                 # Run sync cycle with comprehensive error handling
                 try:
@@ -1137,30 +1241,34 @@ class AsyncBridgeService:
                     self._consecutive_failures = 0
                     self._error_backoff_multiplier = 1
                     self._last_success_time = timezone.localtime()
+                    self._note_opcua_healthy()
                 except ConnectionError as e:
                     # Connection errors are recoverable - don't escalate
                     self._consecutive_failures += 1
                     self._last_failure_time = timezone.localtime()
                     print(f'[Bridge] Connection error (attempt {self._consecutive_failures}): {e}')
+                    self._handle_opcua_unresponsive()
                     # Exponential backoff with jitter: 1s → 1.5s → 2.25s... capped at 15s
                     self._error_backoff_multiplier = min(1.0 + (self._consecutive_failures * 0.15), 15.0)
-                    cycle_delay = 1.0 * self._error_backoff_multiplier + (random.random() * 0.5)
+                    cycle_delay = self._current_poll_interval * self._error_backoff_multiplier + (random.random() * 0.5)
                 except TimeoutError as e:
                     # Timeout during read/write - also recoverable
                     self._consecutive_failures += 1
                     self._last_failure_time = timezone.localtime()
                     print(f'[Bridge] Timeout error (attempt {self._consecutive_failures}): {e}')
+                    self._handle_opcua_unresponsive()
                     self._error_backoff_multiplier = min(1.0 + (self._consecutive_failures * 0.1), 10.0)
-                    cycle_delay = 1.0 * self._error_backoff_multiplier
+                    cycle_delay = self._current_poll_interval * self._error_backoff_multiplier
                 except Exception as exc:
                     # Catch-all for unexpected errors - log but don't crash
                     self._consecutive_failures += 1
                     self._last_failure_time = timezone.localtime()
                     error_type = type(exc).__name__
                     print(f'[Bridge] {error_type} (attempt {self._consecutive_failures}): {exc}')
+                    self._handle_opcua_unresponsive()
                     # More aggressive backoff for unexpected errors
                     self._error_backoff_multiplier = min(1.0 + (self._consecutive_failures * 0.2), 20.0)
-                    cycle_delay = 1.0 * self._error_backoff_multiplier
+                    cycle_delay = self._current_poll_interval * self._error_backoff_multiplier
                 
                 # Periodic health diagnostics
                 if self._cycle_count % self._health_check_interval == 0:
@@ -1210,6 +1318,12 @@ class AsyncBridgeService:
         bridge.setdefault('mode', 'json_async_bridge')
         bridge.setdefault('active', False)
         bridge.setdefault('poll_interval_seconds', 1.0)
+        # Drive the loop cadence from the configured interval (floored so a
+        # misconfigured value can never busy-spin the CPU).
+        try:
+            self._current_poll_interval = max(0.2, float(bridge.get('poll_interval_seconds', 1.0)))
+        except (TypeError, ValueError):
+            self._current_poll_interval = 1.0
         bridge.setdefault('last_sync_status_map', {})
         bridge.setdefault('last_sync_snapshot', {})
         # Increment when we transition from "not connected" -> "connected" (reconnect detection).
@@ -1278,7 +1392,7 @@ class AsyncBridgeService:
             bridge['last_sync_at'] = timezone.localtime().isoformat()
             return
 
-        opcua_client = OpcUaClient(endpoint, timeout=4)
+        opcua_client = None
         success_count = 0
         aligned_count = 0
         conflict_count = 0
@@ -1286,12 +1400,14 @@ class AsyncBridgeService:
         normalized_pairs = [(node_id, plc_tag, plc_tag, plc_tag) for node_id, plc_tag in pairs]
 
         try:
-            # Attempt connection with timeout and error handling
+            # Reuse the persistent OPC UA session instead of reconnecting each
+            # cycle (major latency win over a VPN).
             was_connected = bool(bridge.get('opcua_connected', False))
             try:
-                opcua_client.connect()
+                opcua_client = self._ensure_opcua_client(endpoint)
             except Exception as e:
                 bridge['opcua_connected'] = False
+                self._disconnect_opcua()
                 raise ConnectionError(f'OPC UA connection failed to {endpoint}: {e}') from e
 
             # Verify connection is responsive
@@ -1299,6 +1415,7 @@ class AsyncBridgeService:
                 opcua_client.get_root_node()
             except Exception as e:
                 bridge['opcua_connected'] = False
+                self._disconnect_opcua()
                 raise ConnectionError(f'OPC UA connection is not responsive: {e}') from e
 
             now_connected = True
@@ -1749,16 +1866,14 @@ class AsyncBridgeService:
             
             # Re-raise connection errors for backoff handling, swallow others
             if 'Connection' in error_type or 'Timeout' in error_type:
+                # Drop the persistent OPC UA session so the next cycle rebuilds
+                # it; the watch loop tracks unresponsive time for recovery.
+                self._disconnect_opcua()
                 raise
         finally:
-            # Comprehensive resource cleanup to prevent leaks
-            try:
-                if opcua_client:
-                    opcua_client.disconnect()
-            except Exception as e:
-                print(f'[Bridge] OPC UA cleanup warning: {e}')
-            
-            # Clean up PLC/Modbus/Siemens connections if created locally
+            # The OPC UA client is intentionally kept open across cycles for low
+            # latency; it is only torn down on error (above) or on stop().
+            # Clean up per-cycle PLC/Modbus/Siemens connections created locally.
             try:
                 if is_siemens and 's7_client' in locals() and s7_client:
                     try:
@@ -1795,10 +1910,112 @@ if _init_payload.get('bridge', {}).get('active'):
 del _init_payload
 
 
+MAX_BRIDGE_SLOTS = 3
+
+
+def _store_path_for_slot(slot):
+    """Return the (data_file, backup_dir) for a bridge slot.
+
+    Slot 1 reuses the original files so existing deployments keep working;
+    slots 2 and 3 get their own independent files.
+    """
+    if slot == 1:
+        return _LANDING_DATA_FILE, _LANDING_BACKUP_DIR
+    return (
+        _CACHE_DIR / f'landing_data_{slot}.json',
+        _LANDING_BACKUP_DIR / f'slot_{slot}',
+    )
+
+
+class BridgeManager:
+    """Owns up to MAX_BRIDGE_SLOTS independent PLC<->SCADA bridges.
+
+    Each slot has its own JSON store, its own OPC UA/PLC connections and its own
+    background thread, so up to three connections can run concurrently without
+    interfering with each other. Slot 1 reuses the original global store/bridge
+    for full backward compatibility.
+    """
+
+    def __init__(self, max_slots=MAX_BRIDGE_SLOTS):
+        self.max_slots = max_slots
+        self._slots = {}
+        self._lock = threading.Lock()
+
+    def normalize_slot(self, slot):
+        try:
+            slot = int(slot)
+        except (TypeError, ValueError):
+            slot = 1
+        return min(max(slot, 1), self.max_slots)
+
+    def _create_slot(self, slot):
+        if slot == 1:
+            return _landing_store, _async_bridge
+        data_file, backup_dir = _store_path_for_slot(slot)
+        store = LandingDataStore(data_file, backup_dir)
+        pool = LogixClientPool(idle_close_seconds=90)
+        bridge = AsyncBridgeService(
+            store=store,
+            logix_service=LogixService(pool=pool),
+            pool=pool,
+            opcua_service=_opcua_service,
+        )
+        return store, bridge
+
+    def _slot(self, slot):
+        slot = self.normalize_slot(slot)
+        with self._lock:
+            if slot not in self._slots:
+                self._slots[slot] = self._create_slot(slot)
+            return self._slots[slot]
+
+    def store(self, slot):
+        return self._slot(slot)[0]
+
+    def bridge(self, slot):
+        return self._slot(slot)[1]
+
+    def resume_active(self):
+        """Restart any slot that was left active before the last shutdown."""
+        for slot in range(1, self.max_slots + 1):
+            try:
+                store = self.store(slot)
+                if store.read().get('bridge', {}).get('active'):
+                    self.bridge(slot).ensure_running()
+            except Exception as exc:
+                print(f'[BridgeManager] Slot {slot} resume skipped: {exc}')
+
+    def summary(self):
+        """Lightweight per-slot status list for the UI tab bar."""
+        rows = []
+        for slot in range(1, self.max_slots + 1):
+            try:
+                payload = self.store(slot).read()
+                bridge = payload.get('bridge', {}) or {}
+                plc = payload.get('plc', {}) or {}
+                scada = payload.get('scada', {}) or {}
+                rows.append({
+                    'slot': slot,
+                    'active': bool(bridge.get('active', False)),
+                    'plc': plc.get('connection_path', ''),
+                    'endpoint': scada.get('endpoint', ''),
+                    'result': bridge.get('last_sync_result', ''),
+                    'mapped_count': len(bridge.get('node_address_map', {}) or {}),
+                })
+            except Exception as exc:
+                rows.append({'slot': slot, 'active': False, 'error': str(exc)})
+        return rows
+
+
+_bridge_manager = BridgeManager()
+_bridge_manager.resume_active()
+
+
 @require_GET
 def bridge_status_api(request):
     try:
-        payload = _landing_store.read()
+        slot = _bridge_manager.normalize_slot(request.GET.get('slot', 1))
+        payload = _bridge_manager.store(slot).read()
         bridge = payload.get('bridge', {})
         address_map = bridge.get('node_address_map') or {}
         status_map = dict(bridge.get('last_sync_status_map') or {})
@@ -1806,6 +2023,7 @@ def bridge_status_api(request):
             if node_id and not str(plc_address or '').strip():
                 status_map[node_id] = 'Waiting: address is empty.'
         return JsonResponse({
+            'slot': slot,
             'active': bool(bridge.get('active', False)),
             'result': bridge.get('last_sync_result', ''),
             'sync_at': bridge.get('last_sync_at', ''),
@@ -1815,12 +2033,69 @@ def bridge_status_api(request):
         return JsonResponse({'active': False, 'error': str(exc)}, status=500)
 
 
+@require_GET
+def bridge_slots_api(request):
+    """Return a compact status summary for every bridge slot (for the tab bar)."""
+    try:
+        return JsonResponse({'slots': _bridge_manager.summary()})
+    except Exception as exc:
+        return JsonResponse({'slots': [], 'error': str(exc)}, status=500)
+
+
 class CombinedPageView(View):
     template_name = 'index.html'
     BRIDGE_SNAPSHOT_KEY = 'bridge_last_sync_snapshot'
     BRIDGE_STATUS_KEY = 'opcua_sync_status_map'
     BRIDGE_MAP_KEY = 'opcua_plc_address_map'
     BRIDGE_DTYPE_KEY = 'opcua_plc_data_type_map'
+
+    # Flat session keys that hold one connection's working config. They are
+    # swapped in/out per active slot in dispatch() so each UI tab keeps an
+    # independent PLC/SCADA/mapping configuration while the rest of the view
+    # keeps using these simple key names unchanged.
+    PER_SLOT_SESSION_KEYS = (
+        'last_plc_ip', 'last_plc_brand', 'last_plc_port', 'last_plc_word_swapped',
+        'last_plc_tag', 'landing_last_plc_value', 'landing_last_plc_status',
+        'last_opcua_endpoint', 'opcua_last_endpoint', 'opcua_last_tags',
+        'landing_last_opcua_status', 'landing_last_synced_count',
+        'landing_last_sync_at', 'landing_last_sync_result',
+        'plc_history', 'opcua_history',
+        BRIDGE_SNAPSHOT_KEY, BRIDGE_STATUS_KEY, BRIDGE_MAP_KEY, BRIDGE_DTYPE_KEY,
+    )
+
+    def dispatch(self, request, *args, **kwargs):
+        raw_slot = request.POST.get('slot') if request.method == 'POST' else request.GET.get('slot')
+        if raw_slot in (None, ''):
+            raw_slot = request.session.get('active_bridge_slot', 1)
+        self.slot = _bridge_manager.normalize_slot(raw_slot)
+        self.store = _bridge_manager.store(self.slot)
+        self.bridge = _bridge_manager.bridge(self.slot)
+        self._load_slot_session(request, self.slot)
+        request.session['active_bridge_slot'] = self.slot
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        finally:
+            self._save_slot_session(request, self.slot)
+
+    def _load_slot_session(self, request, slot):
+        """Swap the given slot's saved config into the flat working keys."""
+        saved = (request.session.get('bridge_slot_sessions', {}) or {}).get(str(slot), {})
+        for key in self.PER_SLOT_SESSION_KEYS:
+            if key in saved:
+                request.session[key] = saved[key]
+            else:
+                request.session.pop(key, None)
+
+    def _save_slot_session(self, request, slot):
+        """Persist the current flat working keys back to this slot's namespace."""
+        store = request.session.get('bridge_slot_sessions', {}) or {}
+        store[str(slot)] = {
+            key: request.session[key]
+            for key in self.PER_SLOT_SESSION_KEYS
+            if key in request.session
+        }
+        request.session['bridge_slot_sessions'] = store
+        request.session.modified = True
 
     @staticmethod
     def _normalize_word_swapped(value):
@@ -2029,21 +2304,21 @@ class CombinedPageView(View):
             'show_tag_popup': show_tag_popup and has_discovered_tags,
             'bridge_active': self._get_bridge_active(),
             'bridge_result': self._get_bridge_result(),
+            'active_slot': self.slot,
+            'bridge_slots': _bridge_manager.summary(),
             'app_version': APP_VERSION,
         }
 
-    @staticmethod
-    def _get_bridge_active():
+    def _get_bridge_active(self):
         try:
-            payload = _landing_store.read()
+            payload = self.store.read()
             return bool(payload.get('bridge', {}).get('active', False))
         except Exception:
             return False
 
-    @staticmethod
-    def _get_bridge_result():
+    def _get_bridge_result(self):
         try:
-            payload = _landing_store.read()
+            payload = self.store.read()
             return payload.get('bridge', {}).get('last_sync_result', '')
         except Exception:
             return ''
@@ -2064,7 +2339,7 @@ class CombinedPageView(View):
         saved_port = request.session.get('last_plc_port')
         if saved_port is None:
             try:
-                saved_port = _landing_store.read().get('plc', {}).get('port')
+                saved_port = self.store.read().get('plc', {}).get('port')
             except Exception:
                 pass
         plc_form = PlcReadForm(initial={
@@ -2077,7 +2352,7 @@ class CombinedPageView(View):
         plc_state = ViewState()
         opcua_state = self._cached_opcua_state(request.session)
         try:
-            payload = _landing_store.read()
+            payload = self.store.read()
             plc_data = payload.get('plc') or {}
             scada_data = payload.get('scada') or {}
             bridge = payload.get('bridge', {})
@@ -2114,9 +2389,8 @@ class CombinedPageView(View):
                 request.session['landing_last_synced_count'] = bridge.get('synced_count', 0)
                 request.session['landing_last_sync_at'] = bridge.get('last_sync_at')
                 request.session['landing_last_sync_result'] = bridge.get('last_sync_result', '')
-                global _async_bridge
-                if _async_bridge:
-                    _async_bridge.ensure_running()
+                if self.bridge:
+                    self.bridge.ensure_running()
         except Exception:
             pass
 
@@ -2126,7 +2400,7 @@ class CombinedPageView(View):
         saved_port = request.session.get('last_plc_port')
         if saved_port is None:
             try:
-                saved_port = _landing_store.read().get('plc', {}).get('port')
+                saved_port = self.store.read().get('plc', {}).get('port')
             except Exception:
                 pass
         plc_form = PlcReadForm(initial={
@@ -2142,7 +2416,6 @@ class CombinedPageView(View):
         return render(request, self.template_name, self._build_context(request, plc_state, opcua_state, plc_form, opcua_form))
 
     def post(self, request):
-        global _async_bridge
         action = request.POST.get('action', '').strip().lower()
         show_tag_popup = False
         plc_state = ViewState()
@@ -2201,7 +2474,7 @@ class CombinedPageView(View):
                     messages.error(request, plc_state.message)
                 request.session['landing_last_plc_value'] = plc_state.tag_value
                 request.session['landing_last_plc_status'] = plc_state.tag_status
-                _landing_store.sync_from_session(request, action='plc_read', message=plc_state.message)
+                self.store.sync_from_session(request, action='plc_read', message=plc_state.message)
             else:
                 messages.error(request, 'Please correct the PLC input errors and try again.')
 
@@ -2223,7 +2496,7 @@ class CombinedPageView(View):
                 else:
                     messages.error(request, opcua_state.message)
                 request.session['landing_last_opcua_status'] = opcua_state.tag_status
-                _landing_store.sync_from_session(request, action='opcua_fetch', message=opcua_state.message)
+                self.store.sync_from_session(request, action='opcua_fetch', message=opcua_state.message)
             else:
                 messages.error(request, 'Please correct the OPC UA input errors and try again.')
 
@@ -2261,7 +2534,7 @@ class CombinedPageView(View):
                 messages.success(request, f'Added {added_count} tags to mapping.')
             else:
                 messages.info(request, 'No new tags added (already in mapping).')
-            _landing_store.sync_from_session(request, action='add_selected_tags', message=f'Added {added_count} OPC UA tags to PLC/SCADA mapping.')
+            self.store.sync_from_session(request, action='add_selected_tags', message=f'Added {added_count} OPC UA tags to PLC/SCADA mapping.')
 
         elif action == 'remove_tag':
             node_id = request.POST.get('remove_node_id', '').strip()
@@ -2277,7 +2550,7 @@ class CombinedPageView(View):
             request.session[self.BRIDGE_DTYPE_KEY] = dtype_map
             request.session[self.BRIDGE_STATUS_KEY] = status_map
             messages.success(request, 'Removed tag from mapping.')
-            _landing_store.sync_from_session(request, action='remove_tag', message=f'Removed tag {node_id} from mapping.' if removed else f'Tag {node_id} not found.')
+            self.store.sync_from_session(request, action='remove_tag', message=f'Removed tag {node_id} from mapping.' if removed else f'Tag {node_id} not found.')
 
         elif action == 'remove_selected_tags':
             selected_node_ids = request.POST.getlist('selected_node_ids')
@@ -2364,9 +2637,9 @@ class CombinedPageView(View):
                             'last_message': f'Bridge activated for {len(pairs)} mapped address(es).',
                         }
 
-                    _landing_store.update(enable_bridge, backup_reason='bridge_connected')
-                    if _async_bridge:
-                        _async_bridge.ensure_running()
+                    self.store.update(enable_bridge, backup_reason='bridge_connected')
+                    if self.bridge:
+                        self.bridge.ensure_running()
                         messages.success(
                             request,
                             f'Continuous sync started! Monitoring {len(pairs)} mapped address(es).',
@@ -2381,13 +2654,13 @@ class CombinedPageView(View):
 
 
         elif action == 'refresh_bridge':
-            if _async_bridge:
+            if self.bridge:
                 try:
-                    _async_bridge.run_cycle(force_plc_to_scada=False)
+                    self.bridge.run_cycle(force_plc_to_scada=False)
                 except Exception as exc:
                     messages.error(request, f'Refresh failed: {exc}')
             try:
-                payload = _landing_store.read()
+                payload = self.store.read()
                 bridge = payload.get('bridge', {})
                 address_map = bridge.get('node_address_map', {})
                 dtype_map = bridge.get('data_type_map', {})
@@ -2407,7 +2680,7 @@ class CombinedPageView(View):
             request.session[self.BRIDGE_STATUS_KEY] = {}
             request.session[self.BRIDGE_SNAPSHOT_KEY] = {}
             messages.info(request, 'All table address inputs have been cleared.')
-            _landing_store.sync_from_session(request, action='clear_table_addresses', message='All PLC address mappings were cleared.')
+            self.store.sync_from_session(request, action='clear_table_addresses', message='All PLC address mappings were cleared.')
 
         elif action == 'save_plc_config':
             plc_config_save_form = PlcConfigSaveForm(request.POST)
@@ -2424,7 +2697,7 @@ class CombinedPageView(View):
                         messages.success(request, f'Configuration saved: {config_path.name}')
                         plc_config_save_form = PlcConfigSaveForm()
                         plc_config_load_form = PlcConfigLoadForm(file_choices=self._config_file_choices())
-                        _landing_store.sync_from_session(request, action='save_plc_config', message=f'Configuration saved to YAML: {config_path.name}', backup_reason='save_plc_config')
+                        self.store.sync_from_session(request, action='save_plc_config', message=f'Configuration saved to YAML: {config_path.name}', backup_reason='save_plc_config')
                     except Exception as exc:
                         messages.error(request, f'Unable to save YAML file: {exc}')
 
@@ -2455,7 +2728,7 @@ class CombinedPageView(View):
 
                         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
                         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
-                        _landing_store.sync_from_session(
+                        self.store.sync_from_session(
                             request,
                             action='load_plc_config',
                             message=f'Configuration loaded from YAML: {config_path.name}',
@@ -2479,9 +2752,9 @@ class CombinedPageView(View):
                                     'last_message': f'Bridge auto-activated for {len(address_map)} mapped address(es).',
                                 }
 
-                            _landing_store.update(auto_enable_bridge, backup_reason='auto_bridge_from_load')
-                            if _async_bridge:
-                                _async_bridge.ensure_running()
+                            self.store.update(auto_enable_bridge, backup_reason='auto_bridge_from_load')
+                            if self.bridge:
+                                self.bridge.ensure_running()
                                 messages.success(request, f'Continuous sync auto-started! Monitoring {len(address_map)} mapped address(es).')
                     except Exception as exc:
                         messages.error(request, f'Unable to load YAML file: {exc}')
@@ -2519,7 +2792,7 @@ class CombinedPageView(View):
                         opcua_host, opcua_port = self._split_opcua_endpoint(request.session.get('last_opcua_endpoint', ''))
 
                         opcua_form = OpcUaFetchForm(initial={'opcua_host': opcua_host, 'opcua_port': opcua_port})
-                        _landing_store.sync_from_session(request, action='import_plc_config', message=f'Configuration imported from YAML: {config_path.name}', backup_reason='import_plc_config')
+                        self.store.sync_from_session(request, action='import_plc_config', message=f'Configuration imported from YAML: {config_path.name}', backup_reason='import_plc_config')
                     except UnicodeDecodeError:
                         messages.error(request, 'Import failed: file must be UTF-8 encoded text.')
                     except Exception as exc:
@@ -2536,7 +2809,7 @@ class CombinedPageView(View):
             request.session['landing_last_synced_count'] = 0
             request.session['landing_last_sync_at'] = None
             request.session['landing_last_sync_result'] = ''
-            _landing_store.sync_from_session(request, action='clear_plc_config', message='Current PLC/SCADA session values were cleared.')
+            self.store.sync_from_session(request, action='clear_plc_config', message='Current PLC/SCADA session values were cleared.')
 
         elif action == 'clear_history':
             clear_form = ClearHistoryForm(request.POST)

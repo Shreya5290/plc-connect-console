@@ -1192,6 +1192,27 @@
       .tag-item-head{grid-template-columns:auto 1fr}
       .tag-toggle{grid-column:2;justify-self:start}
     }
+
+    /* Connection slot tabs (multi-session support) */
+    .slot-tabs{display:flex;gap:8px;margin:14px 0 4px;flex-wrap:wrap}
+    .slot-tab{
+      display:flex;align-items:center;gap:8px;
+      padding:8px 16px;border-radius:10px 10px 0 0;
+      background:#0f2027;border:1px solid #1f3a44;border-bottom:none;
+      color:#9fb8c2;text-decoration:none;font-size:.85rem;font-weight:600;
+      transition:background .15s,color .15s;
+    }
+    .slot-tab:hover{background:#143038;color:#cfe6ee}
+    .slot-tab.is-active{
+      background:var(--brand);color:#fff;border-color:var(--brand);
+      box-shadow:0 -2px 8px rgba(26,127,143,.35);
+    }
+    .slot-tab .slot-dot{
+      width:9px;height:9px;border-radius:50%;
+      background:#6b7c85;flex:none;box-shadow:0 0 0 2px rgba(0,0,0,.15);
+    }
+    .slot-tab .slot-dot.is-on{background:#3ddc84;box-shadow:0 0 6px #3ddc84}
+    .slot-tab .slot-sub{font-size:.68rem;font-weight:500;opacity:.8}
   </style>
 </head>
 <body>
@@ -1251,6 +1272,18 @@
         <span class="badge" style="background:#1a1a2e;color:#64b5f6;font-size:0.75rem;margin-left:8px;">v{{ app_version }}</span>
         <h1>Click2Connect</h1>
       </header>
+
+      <!-- Connection slot tabs: up to 3 concurrent PLC<->SCADA sessions -->
+      <nav class="slot-tabs" aria-label="Connection sessions">
+        {% for s in bridge_slots %}
+          <a class="slot-tab{% if s.slot == active_slot %} is-active{% endif %}" href="?slot={{ s.slot }}">
+            <span class="slot-dot{% if s.active %} is-on{% endif %}"></span>
+            <span>Connection {{ s.slot }}
+              {% if s.endpoint or s.plc %}<span class="slot-sub">{{ s.endpoint|default:s.plc }}</span>{% endif %}
+            </span>
+          </a>
+        {% endfor %}
+      </nav>
       
       {% if messages %}
         <section class="alerts">
@@ -1734,7 +1767,7 @@
     </div>
   {% endif %}
 {{ has_opcua_tags|json_script:"has-opcua-tags" }}
-<span id="bridge-config" data-active="{{ bridge_active|yesno:"true,false" }}" hidden></span>
+<span id="bridge-config" data-active="{{ bridge_active|yesno:"true,false" }}" data-slot="{{ active_slot }}" hidden></span>
 <script>
   // Add Tags button opens the OPC UA tag browser popup
   document.addEventListener('DOMContentLoaded', function() {
@@ -1978,7 +2011,9 @@
     });
 
     // Auto-refresh bridge status every 5 seconds when bridge is active
-    var bridgeActive = JSON.parse(document.getElementById('bridge-config').dataset.active);
+    var bridgeConfigEl = document.getElementById('bridge-config');
+    var bridgeActive = JSON.parse(bridgeConfigEl.dataset.active);
+    var activeSlot = bridgeConfigEl.dataset.slot || '1';
     if (bridgeActive) {
       setInterval(function() {
         if (document.hidden) return;
@@ -1992,7 +2027,7 @@
             if (iconEl) iconEl.outerHTML = '<span class="spinner-ring"></span>';
           }
         });
-        fetch('/api/bridge-status/')
+        fetch('/api/bridge-status/?slot=' + encodeURIComponent(activeSlot))
           .then(function(r) { return r.json(); })
           .then(function(data) {
             if (!data.active) return;

@@ -3,9 +3,9 @@ PyInstaller build script for Click2Connect ONEFILE EXE
 Generates a single standalone executable
 """
 
-import sys
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,6 +25,7 @@ result = subprocess.run(
     [sys.executable, "-m", "pip", "show", "pyinstaller"],
     capture_output=True,
     text=True,
+    check=False,
 )
 
 if result.returncode != 0:
@@ -36,10 +37,9 @@ if result.returncode != 0:
 
 # Verify PyInstaller
 try:
-    import PyInstaller  # noqa: F401
-    import PyInstaller.__main__  # noqa: F401
-except Exception as e:
-    print(f"ERROR: Could not load PyInstaller: {e}")
+    from PyInstaller import __main__ as pyinstaller_main  # type: ignore[import-untyped]
+except ImportError as exc:
+    print(f"ERROR: Could not load PyInstaller: {exc}")
     sys.exit(1)
 
 # Clean old builds
@@ -90,9 +90,7 @@ print(f"  ✓ {spec_file.name}")
 print("\n[Build] Compiling ONEFILE executable...")
 print(f"  Building: {EXE_NAME}.exe\n")
 
-import PyInstaller.__main__
-
-PyInstaller.__main__.run(
+pyinstaller_main.run(
     [
         str(spec_file),
         "--noconfirm",
@@ -115,7 +113,7 @@ if exe_path.exists():
     print(f"   {exe_path}\n")
 
     print("📋 DEPLOYMENT:")
-    print("   1. Copy {0}".format(exe_path.name))
+    print(f"   1. Copy {exe_path.name}")
     print("   2. Send it to the target PC")
     print("   3. Double-click the EXE")
     print("   4. Wait a few seconds for startup")
@@ -128,11 +126,8 @@ else:
     # Don't fail hard if PyInstaller produced a different path;
     # print directory listing to help diagnose.
     print(f"\n❌ BUILD FAILED - EXE NOT FOUND at: {exe_path}")
-    try:
-        print("Existing files in dist_portable:")
-        for p in sorted(DIST_DIR.glob("*")):
-            print("  -", p.name)
-    except Exception:
-        pass
+    print("Existing files in dist_portable:")
+    for p in sorted(DIST_DIR.glob("*")):
+        print("  -", p.name)
     sys.exit(1)
 

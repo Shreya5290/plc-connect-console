@@ -39,6 +39,10 @@ def main() -> int:
         # Ensure Django settings are discoverable
         os.environ.setdefault("DJANGO_SETTINGS_MODULE", "plc_connect.settings")
 
+        # Hide Django's "development server / not for production" banner. This is
+        # a deliberate single-user local tool, so the warning is noise.
+        os.environ.setdefault("DJANGO_RUNSERVER_HIDE_WARNING", "true")
+
         # Let onefile extraction finish
         time.sleep(0.2)
 
