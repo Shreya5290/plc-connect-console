@@ -763,6 +763,23 @@
       min-width:220px;
     }
 
+    .poll-field{
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      font-size:.85rem;
+      color:#44607a;
+      white-space:nowrap;
+    }
+
+    .poll-field input{
+      width:92px;
+      padding:6px 8px;
+      border:1px solid #c8d8e4;
+      border-radius:6px;
+      font-size:.85rem;
+    }
+
     .config-top{
       margin:0 18px;
       border:1px solid #c8d8e4;
@@ -1459,6 +1476,8 @@
           <p class="hint">Configure mappings below and click <b>Connect & Start Sync</b> to begin continuous synchronization. The system will automatically keep PLC and SCADA values synchronized.</p>
           {% if bridge_active %}
           <p class="hint" style="color:#2ecc71;font-weight:600;">&#9679; Bridge is active and syncing. <span class="bridge-result-text">{% if bridge_result %}Last: {{ bridge_result }}{% endif %}</span></p>
+          {% elif has_opcua_tags %}
+          <p class="hint" style="color:#f0ad4e;font-weight:600;">&#9632; Sync is stopped for this connection. Mappings are kept &mdash; adjust the settings, then press <b>Connect &amp; Start Sync</b>.</p>
           {% endif %}
           {% if not has_opcua_tags %}
             <p class="disabled-note">Add tags to mapping to enable address editing and bridge connection.</p>
@@ -1541,6 +1560,10 @@
           <div class="action-row">
             <button class="btn primary" type="submit" name="action" value="connect_bridge" {% if not has_opcua_tags %}disabled{% endif %}>Connect & Start Sync</button>
             <button class="btn{% if bridge_active %} refresh-active{% endif %}" type="submit" name="action" value="refresh_bridge" {% if not bridge_active %}disabled{% endif %}>&#x21bb; Refresh Sync</button>
+            <button class="btn warn" type="submit" name="action" value="stop_bridge" {% if not bridge_active %}disabled{% endif %}>&#9632; Stop Sync</button>
+            <label class="poll-field" title="Bridge cycle period. This is the tag-update latency floor.">Sync every
+              <input type="number" name="poll_interval_ms" value="{{ bridge_poll_ms }}" min="50" max="60000" step="50"> ms
+            </label>
             <span id="remove-selected-confirm-wrap">
               <button type="button" class="btn warn remove-tags-btn-ui" id="remove-selected-btn" {% if not has_opcua_tags %}disabled{% endif %}>
                 <span style="display:inline-flex;align-items:center;gap:6px;font-weight:700;font-size:1.05em;">
@@ -2010,23 +2033,17 @@
       if (raw) renderStatus(el.parentElement, raw);
     });
 
-    // Auto-refresh bridge status every 5 seconds when bridge is active
+    // Auto-refresh bridge status while the bridge is active. Chained timeouts
+    // (not setInterval) so slow responses cannot pile up overlapping requests.
     var bridgeConfigEl = document.getElementById('bridge-config');
     var bridgeActive = JSON.parse(bridgeConfigEl.dataset.active);
     var activeSlot = bridgeConfigEl.dataset.slot || '1';
     if (bridgeActive) {
-      setInterval(function() {
-        if (document.hidden) return;
-        // Show loading spinners while fetching
-        var rows = document.querySelectorAll('.card--map tbody tr');
-        rows.forEach(function(row) {
-          var statusCell = row.querySelector('.value-col');
-          var syncText = statusCell ? statusCell.querySelector('.sync-text') : null;
-          if (syncText) {
-            var iconEl = statusCell.querySelector('.sync-icon');
-            if (iconEl) iconEl.outerHTML = '<span class="spinner-ring"></span>';
-          }
-        });
+      var POLL_MS = 1000;
+      var pollStatus;
+      var schedulePoll = function() { setTimeout(pollStatus, POLL_MS); };
+      pollStatus = function() {
+        if (document.hidden) { schedulePoll(); return; }
         fetch('/api/bridge-status/?slot=' + encodeURIComponent(activeSlot))
           .then(function(r) { return r.json(); })
           .then(function(data) {
@@ -2045,6 +2062,8 @@
                 return;
               }
               if (statusCell && data.status_map && data.status_map[nodeId] !== undefined) {
+                var textEl = statusCell.querySelector('.sync-text');
+                if (textEl && textEl.textContent === data.status_map[nodeId]) return;
                 renderStatus(statusCell, data.status_map[nodeId]);
               }
             });
@@ -2054,15 +2073,10 @@
               resultEl.textContent = 'Last: ' + data.result;
             }
           })
-          .catch(function() {
-            // On error, restore non-spinner state
-            var rows = document.querySelectorAll('.card--map tbody tr');
-            rows.forEach(function(row) {
-              var spinner = row.querySelector('.spinner-ring');
-              if (spinner) spinner.outerHTML = '<span class="sync-icon sync-icon--fail">✖</span>';
-            });
-          });
-      }, 5000);
+          .catch(function() { /* transient failure: the next poll retries */ })
+          .finally(schedulePoll);
+      };
+      schedulePoll();
     }
   })();
 </script>

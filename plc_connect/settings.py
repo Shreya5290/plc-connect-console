@@ -170,7 +170,7 @@ LOGGING = {
 BRIDGE_CONFIG = {
     'max_consecutive_failures': 50,  # Allow many retries before throttling
     'health_check_interval': 10,  # Check health every 10 cycles
-    'poll_interval_seconds': 1.0,  # Normal poll interval
+    'poll_interval_seconds': 0.25,  # Bridge cycle period (also the tag-update latency floor)
     'connection_timeout': 5.0,  # Connection timeout in seconds
     'read_timeout': 4.0,  # Read operation timeout
     'write_timeout': 4.0,  # Write operation timeout

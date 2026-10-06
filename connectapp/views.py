@@ -30,9 +30,44 @@ from .forms import (
 
 try:
     from opcua import Client as OpcUaClient, ua
+    from opcua.common import ua_utils as _ua_utils
 except Exception:
     OpcUaClient = None
     ua = None
+    _ua_utils = None
+
+# ns=0;i=2257 == Server_ServerStatus_StartTime (used for SCADA restart detection).
+_OPCUA_SERVER_START_TIME_NODE = 'i=2257'
+
+_BRIDGE_CONFIG = getattr(settings, 'BRIDGE_CONFIG', {}) or {}
+try:
+    DEFAULT_POLL_INTERVAL = float(_BRIDGE_CONFIG.get('poll_interval_seconds', 0.25))
+except (TypeError, ValueError):
+    DEFAULT_POLL_INTERVAL = 0.25
+# Floor only guards against a misconfigured value busy-spinning the CPU.
+MIN_POLL_INTERVAL = 0.05
+MAX_POLL_INTERVAL = 60.0
+
+
+def normalize_poll_interval(value, fallback=None):
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_POLL_INTERVAL if fallback is None else fallback
+    return min(max(interval, MIN_POLL_INTERVAL), MAX_POLL_INTERVAL)
+
+
+class _DeferredScadaWrite:
+    """Queues an OPC UA write so the whole cycle flushes in one batched request."""
+
+    __slots__ = ('node_id', 'queue')
+
+    def __init__(self, node_id, queue):
+        self.node_id = node_id
+        self.queue = queue
+
+    def set_value(self, value, variant_type=None):
+        self.queue.append((self.node_id, value, variant_type))
 
 _SNAP7_IMPORT_ERROR = None
 _Snap7Client = None
@@ -907,7 +942,7 @@ class LandingDataStore:
             'plc': {'brand': 'allen_bradley', 'connection_path': '', 'last_tag': '', 'last_value': None, 'last_status': ''},
             'scada': {'endpoint': '', 'last_fetch_status': '', 'discovered_tags': []},
             'bridge': {
-                'mode': 'json_async_bridge', 'active': False, 'poll_interval_seconds': 1.0,
+                'mode': 'json_async_bridge', 'active': False, 'poll_interval_seconds': DEFAULT_POLL_INTERVAL,
                 'node_address_map': {}, 'mapped_count': 0, 'synced_count': 0,
                 'last_sync_at': None, 'last_sync_result': '', 'last_sync_status_map': {}, 'last_sync_snapshot': {},
             },
@@ -932,12 +967,15 @@ class LandingDataStore:
         return self.default_payload()
 
     def read(self):
+        # Read-only: rewriting on every read made the status API and page render
+        # contend with the bridge for this lock (and the disk) many times a second.
         with self._lock:
             payload = self._read_unlocked()
-            try:
-                self._write_unlocked(payload)
-            except PermissionError:
-                pass
+            if not self.data_path.exists():
+                try:
+                    self._write_unlocked(payload)
+                except OSError:
+                    pass
             return payload
 
     def _write_unlocked(self, payload):
@@ -999,7 +1037,7 @@ class LandingDataStore:
             payload['bridge'] = {
                 'mode': 'json_async_bridge',
                 'active': bool(existing_bridge.get('active', False)),
-                'poll_interval_seconds': existing_bridge.get('poll_interval_seconds', 1.0),
+                'poll_interval_seconds': existing_bridge.get('poll_interval_seconds', DEFAULT_POLL_INTERVAL),
                 'node_address_map': request.session.get(CombinedPageView.BRIDGE_MAP_KEY, {}),
                 'data_type_map': request.session.get(CombinedPageView.BRIDGE_DTYPE_KEY, {}),
                 'mapped_count': len(request.session.get(CombinedPageView.BRIDGE_MAP_KEY, {})),
@@ -1014,7 +1052,16 @@ class LandingDataStore:
 
 
 class AsyncBridgeService:
-    def __init__(self, store, logix_service, pool, opcua_service):
+    # Only these bridge keys are produced by a cycle; everything else in the
+    # store (mappings, endpoint, ...) belongs to the UI and must not be clobbered.
+    _CYCLE_RESULT_KEYS = (
+        'synced_count', 'last_sync_at', 'last_sync_result', 'last_sync_status_map',
+        'last_sync_snapshot', 'opcua_connected', 'opcua_reconnect_epoch',
+        'opcua_reconnect_recovering', 'opcua_reconnect_recovery_cycles',
+        'opcua_server_start_time',
+    )
+
+    def __init__(self, store, logix_service, pool, opcua_service, cycle_phase=0.0):
         self.store = store
         self.logix_service = logix_service
         self.pool = pool
@@ -1022,6 +1069,11 @@ class AsyncBridgeService:
         self._thread = None
         self._guard = threading.Lock()
         self._stop_event = threading.Event()
+        # Serialises background cycles against manual refreshes now that the
+        # cycle no longer runs inside the store lock.
+        self._cycle_lock = threading.Lock()
+        # Staggers slots so three bridges do not hit the network on the same tick.
+        self._cycle_phase = float(cycle_phase or 0.0)
         # Production-grade resilience tracking
         self._consecutive_failures = 0
         self._max_consecutive_failures = 50  # Allow many failures before throttling
@@ -1037,8 +1089,17 @@ class AsyncBridgeService:
         # is kept open and only rebuilt when the endpoint changes or drops.
         self._opcua_client = None
         self._opcua_endpoint = None
+        # Node proxies and variant types resolved once per session instead of
+        # one DataType read per tag per cycle.
+        self._opcua_node_cache = {}
+        self._opcua_variant_cache = {}
+        # Persistent PLC links (reconnecting every cycle added a full handshake).
+        self._snap7_client = None
+        self._snap7_host = None
+        self._modbus_client = None
+        self._modbus_target = None
         # Base cycle delay, refreshed from the configured poll interval each cycle.
-        self._current_poll_interval = 1.0
+        self._current_poll_interval = DEFAULT_POLL_INTERVAL
         # SCADA-shutdown recovery (auto disconnect/reconnect of OPC UA).
         self._opcua_unresponsive_since = None
         self._opcua_reconnect_attempts = 0
@@ -1126,6 +1187,7 @@ class AsyncBridgeService:
                 if self._thread.is_alive():
                     print('[Bridge] WARNING: Bridge thread did not stop cleanly (will be terminated)')
             self._disconnect_opcua()
+            self._disconnect_plc_clients()
             print('[Bridge] Shutdown complete')
 
     def _disconnect_opcua(self):
@@ -1133,11 +1195,66 @@ class AsyncBridgeService:
         client = self._opcua_client
         self._opcua_client = None
         self._opcua_endpoint = None
+        self._opcua_node_cache = {}
+        self._opcua_variant_cache = {}
         if client is not None:
             try:
                 client.disconnect()
             except Exception:
                 pass
+
+    def _disconnect_plc_clients(self):
+        """Drop the persistent Siemens/Modbus links so the next cycle rebuilds them."""
+        s7_client = self._snap7_client
+        self._snap7_client = None
+        self._snap7_host = None
+        if s7_client is not None:
+            try:
+                s7_client.disconnect()
+            except Exception:
+                pass
+        modbus_client = self._modbus_client
+        self._modbus_client = None
+        self._modbus_target = None
+        if modbus_client is not None:
+            try:
+                modbus_client.close()
+            except Exception:
+                pass
+
+    def _ensure_snap7_client(self, host):
+        """Return a connected Snap7 client, reusing the link across cycles."""
+        client = self._snap7_client
+        if client is not None and self._snap7_host == host:
+            try:
+                if client.get_connected():
+                    return client
+            except Exception:
+                pass
+        self._disconnect_plc_clients()
+        if _Snap7Client is None:
+            raise RuntimeError('python-snap7 library could not be loaded.')
+        client = _Snap7Client()
+        client.connect(host, 0, 0)
+        if not client.get_connected():
+            raise ConnectionError(f'Siemens PLC connection failed at {host}')
+        self._snap7_client = client
+        self._snap7_host = host
+        return client
+
+    def _ensure_modbus_client(self, host, port):
+        """Return a connected Modbus client, reusing the socket across cycles."""
+        target = (host, int(port))
+        client = self._modbus_client
+        if client is not None and self._modbus_target == target and getattr(client, 'connected', False):
+            return client
+        self._disconnect_plc_clients()
+        client = ModbusTcpClient(host, port=int(port), timeout=5)
+        if not client.connect():
+            raise ConnectionError(f'Unable to connect to Modbus PLC at {host}:{port}')
+        self._modbus_client = client
+        self._modbus_target = target
+        return client
 
     def _ensure_opcua_client(self, endpoint):
         """Return a connected OPC UA client, reusing the persistent connection.
@@ -1156,6 +1273,75 @@ class AsyncBridgeService:
         self._opcua_client = client
         self._opcua_endpoint = endpoint
         return client
+
+    def _opcua_nodes(self, client, node_ids):
+        """Return cached Node proxies (construction is local, but not free at 150 tags)."""
+        cache = self._opcua_node_cache
+        nodes = []
+        for node_id in node_ids:
+            node = cache.get(node_id)
+            if node is None:
+                node = client.get_node(node_id)
+                cache[node_id] = node
+            nodes.append(node)
+        return nodes
+
+    @staticmethod
+    def _variant_type_from_datatype(client, datatype_nodeid):
+        identifier = getattr(datatype_nodeid, 'Identifier', None)
+        if getattr(datatype_nodeid, 'NamespaceIndex', 0) == 0 and isinstance(identifier, int) and 1 <= identifier <= 25:
+            return ua.VariantType(identifier)
+        if _ua_utils is None:
+            return None
+        return _ua_utils.data_type_to_variant_type(client.get_node(datatype_nodeid))
+
+    def _opcua_variant_types(self, client, node_ids):
+        """Resolve each node's variant type once per session, batched on first use."""
+        cache = self._opcua_variant_cache
+        missing = [node_id for node_id in node_ids if node_id not in cache]
+        if missing:
+            nodes = self._opcua_nodes(client, missing)
+            results = client.uaclient.get_attributes([node.nodeid for node in nodes], ua.AttributeIds.DataType)
+            for node_id, result in zip(missing, results):
+                try:
+                    if result.StatusCode.is_good() and result.Value is not None:
+                        cache[node_id] = self._variant_type_from_datatype(client, result.Value.Value)
+                    else:
+                        cache[node_id] = None
+                except Exception:
+                    cache[node_id] = None
+        return {node_id: cache.get(node_id) for node_id in node_ids}
+
+    def _opcua_read_values(self, client, node_ids):
+        """Read every mapped node in a single OPC UA request."""
+        if not node_ids:
+            return {}
+        nodes = self._opcua_nodes(client, node_ids)
+        results = client.uaclient.get_attributes([node.nodeid for node in nodes], ua.AttributeIds.Value)
+        values = {}
+        for node_id, result in zip(node_ids, results):
+            good = result.StatusCode.is_good() and result.Value is not None
+            values[node_id] = result.Value.Value if good else None
+        return values
+
+    def _opcua_write_values(self, client, writes):
+        """Flush all queued writes in one OPC UA request; returns {node_id: error}."""
+        if not writes:
+            return {}
+        node_ids = [node_id for node_id, _, _ in writes]
+        nodes = self._opcua_nodes(client, node_ids)
+        datavalues = []
+        for _, value, variant_type in writes:
+            if variant_type is None:
+                datavalues.append(ua.DataValue(ua.Variant(value)))
+            else:
+                datavalues.append(ua.DataValue(ua.Variant(value, variant_type)))
+        results = client.uaclient.set_attributes([node.nodeid for node in nodes], datavalues, ua.AttributeIds.Value)
+        errors = {}
+        for node_id, result in zip(node_ids, results):
+            if not result.is_good():
+                errors[node_id] = str(result)
+        return errors
 
     def _note_opcua_healthy(self):
         """Reset SCADA-recovery counters after a successful cycle."""
@@ -1228,11 +1414,14 @@ class AsyncBridgeService:
     async def _watch_forever(self):
         """Production-grade endless monitoring loop with auto-recovery."""
         import random
+        if self._cycle_phase:
+            await asyncio.sleep(self._cycle_phase)
         while not self._stop_event.is_set():
             self._cycle_count += 1
             # Honor the operator-configured poll interval instead of a fixed 1s.
             # A missing/invalid value falls back to a safe default.
             cycle_delay = self._current_poll_interval
+            cycle_started = perf_counter()
             try:
                 # Run sync cycle with comprehensive error handling
                 try:
@@ -1274,9 +1463,11 @@ class AsyncBridgeService:
                 if self._cycle_count % self._health_check_interval == 0:
                     await self._perform_health_check()
                 
-                # Sleep with interruption support
+                # Sleep with interruption support. Fixed-rate, not fixed-delay:
+                # sleeping a full interval *after* the cycle was the idle gap
+                # seen at the end of every cycle.
                 try:
-                    await asyncio.sleep(cycle_delay)
+                    await asyncio.sleep(max(0.0, cycle_delay - (perf_counter() - cycle_started)))
                 except asyncio.CancelledError:
                     print('[Bridge] Received cancellation signal, gracefully shutting down...')
                     break
@@ -1310,20 +1501,46 @@ class AsyncBridgeService:
 
     def run_cycle(self, force_plc_to_scada=False):
         if self._stop_event.is_set():
-            return
-        return self.store.update(lambda payload: self._sync_payload(payload, force_plc_to_scada=force_plc_to_scada))
+            return None
+        # The store lock is held only to load and to commit. Holding it across
+        # the PLC/OPC round trips blocked the status API and every page render,
+        # which is what made a third concurrent slot feel unusable.
+        with self._cycle_lock:
+            payload = self.store.read()
+            try:
+                self._sync_payload(payload, force_plc_to_scada=force_plc_to_scada)
+            finally:
+                self._commit_cycle(payload)
+            return payload
+
+    def _commit_cycle(self, payload):
+        """Persist only this cycle's results so concurrent UI edits are not lost."""
+        cycle_bridge = payload.get('bridge') or {}
+        runtime = payload.get('runtime')
+        self_stopped = cycle_bridge.get('active') is False
+
+        def mutate(current):
+            bridge = current.setdefault('bridge', {})
+            for key in self._CYCLE_RESULT_KEYS:
+                if key in cycle_bridge:
+                    bridge[key] = cycle_bridge[key]
+            if self_stopped:
+                bridge['active'] = False
+            if runtime is not None:
+                current['runtime'] = runtime
+
+        try:
+            self.store.update(mutate)
+        except Exception as exc:
+            print(f'[Bridge] Failed to persist cycle result: {exc}')
 
     def _sync_payload(self, payload, force_plc_to_scada=False):
         bridge = payload.setdefault('bridge', {})
         bridge.setdefault('mode', 'json_async_bridge')
         bridge.setdefault('active', False)
-        bridge.setdefault('poll_interval_seconds', 1.0)
-        # Drive the loop cadence from the configured interval (floored so a
-        # misconfigured value can never busy-spin the CPU).
-        try:
-            self._current_poll_interval = max(0.2, float(bridge.get('poll_interval_seconds', 1.0)))
-        except (TypeError, ValueError):
-            self._current_poll_interval = 1.0
+        bridge.setdefault('poll_interval_seconds', DEFAULT_POLL_INTERVAL)
+        # Drive the loop cadence from the configured interval.
+        self._current_poll_interval = normalize_poll_interval(bridge.get('poll_interval_seconds'))
         bridge.setdefault('last_sync_status_map', {})
         bridge.setdefault('last_sync_snapshot', {})
         # Increment when we transition from "not connected" -> "connected" (reconnect detection).
@@ -1410,9 +1627,16 @@ class AsyncBridgeService:
                 self._disconnect_opcua()
                 raise ConnectionError(f'OPC UA connection failed to {endpoint}: {e}') from e
 
-            # Verify connection is responsive
+            # One batched request replaces the per-tag DataType + Value reads
+            # that dominated cycle time (2 round trips x tag count).
+            node_ids = [node_id for node_id, _, _, _ in normalized_pairs]
+            scada_writes = []
+            read_ids = list(node_ids)
+            if _OPCUA_SERVER_START_TIME_NODE not in read_ids:
+                read_ids.append(_OPCUA_SERVER_START_TIME_NODE)
             try:
-                opcua_client.get_root_node()
+                variant_types = self._opcua_variant_types(opcua_client, node_ids)
+                scada_values = self._opcua_read_values(opcua_client, read_ids)
             except Exception as e:
                 bridge['opcua_connected'] = False
                 self._disconnect_opcua()
@@ -1422,21 +1646,18 @@ class AsyncBridgeService:
 
             # Reliable SCADA-restart detection.
             #
-            # The bridge opens a fresh OPC UA connection every cycle, so a brief
-            # SCADA restart between two polls can go unnoticed if no cycle happens
-            # to catch the socket down (opcua_connected stays True). When that
-            # happens the server comes back reporting initial/default values
-            # (e.g. 0) that would otherwise be mistaken for an operator write and
-            # pushed to the PLC, destroying setpoints. To catch every restart we
-            # also compare the server's ServerStatus StartTime, which changes on
-            # each server start.
+            # The OPC UA session is now persistent, so a brief SCADA restart
+            # between two polls can go unnoticed if no cycle happens to catch the
+            # socket down (opcua_connected stays True). When that happens the
+            # server comes back reporting initial/default values (e.g. 0) that
+            # would otherwise be mistaken for an operator write and pushed to the
+            # PLC, destroying setpoints. To catch every restart we also compare
+            # the server's ServerStatus StartTime, which changes on each server
+            # start and rides along in the batched read above.
             server_restarted = False
             server_start_time = None
             try:
-                # ns=0;i=2257 == Server_ServerStatus_StartTime
-                server_start_time = opcua_client.get_node(
-                    ua.NodeId(2257, 0)
-                ).get_value()
+                server_start_time = scada_values.get(_OPCUA_SERVER_START_TIME_NODE)
                 if server_start_time is not None:
                     server_start_key = str(server_start_time)
                     previous_start_key = bridge.get('opcua_server_start_time')
@@ -1488,11 +1709,8 @@ class AsyncBridgeService:
                     raise RuntimeError(f'Invalid Siemens PLC address: {plc_path}')
                 if _Snap7Client is None:
                     raise RuntimeError('python-snap7 library could not be loaded.')
-                s7_client = _Snap7Client()
                 try:
-                    s7_client.connect(host, 0, 0)
-                    if not s7_client.get_connected():
-                        raise ConnectionError(f'Siemens PLC connection failed at {host}')
+                    s7_client = self._ensure_snap7_client(host)
                 except Exception as e:
                     raise ConnectionError(f'Siemens connection error: {e}') from e
                 try:
@@ -1504,9 +1722,9 @@ class AsyncBridgeService:
                                 failed_count += 1
                                 continue
                             plc_value = _snap7_service._read_area(s7_client, parsed)
-                            node = opcua_client.get_node(node_id)
-                            variant_type = node.get_data_type_as_variant_type()
-                            scada_value = node.get_value()
+                            node = _DeferredScadaWrite(node_id, scada_writes)
+                            variant_type = variant_types.get(node_id)
+                            scada_value = scada_values.get(node_id)
 
                             snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                             has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
@@ -1586,17 +1804,16 @@ class AsyncBridgeService:
                         except Exception as exc:
                             status_map[node_id] = f'Sync failed: {exc}'
                             failed_count += 1
-                finally:
-                    s7_client.disconnect()
+                except Exception:
+                    self._disconnect_plc_clients()
+                    raise
             elif is_modbus:
                 host = PymodbusService._parse_host(plc_path)[0]
                 if not host:
                     raise RuntimeError(f'Invalid Modbus PLC address: {plc_path}')
                 plc_port = int((payload.get('plc') or {}).get('port') or 502)
-                modbus_client = ModbusTcpClient(host, port=plc_port, timeout=5)
                 try:
-                    if not modbus_client.connect():
-                        raise ConnectionError(f'Unable to connect to Modbus PLC at {plc_path}:502')
+                    modbus_client = self._ensure_modbus_client(host, plc_port)
                 except Exception as e:
                     raise ConnectionError(f'Modbus connection error: {e}') from e
                 try:
@@ -1642,9 +1859,9 @@ class AsyncBridgeService:
                                 status_map[node_id] = f'PLC read failed for {address_label}'
                                 failed_count += 1
                                 continue
-                            node = opcua_client.get_node(node_id)
-                            variant_type = node.get_data_type_as_variant_type()
-                            scada_value = node.get_value()
+                            node = _DeferredScadaWrite(node_id, scada_writes)
+                            variant_type = variant_types.get(node_id)
+                            scada_value = scada_values.get(node_id)
                             snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                             has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
 
@@ -1741,8 +1958,9 @@ class AsyncBridgeService:
                         except Exception as exc:
                             status_map[node_id] = f'Sync failed: {exc}'
                             failed_count += 1
-                finally:
-                    modbus_client.close()
+                except Exception:
+                    self._disconnect_plc_clients()
+                    raise
             else:
                 plc = self.pool.get(internal_path)
                 try:
@@ -1763,9 +1981,9 @@ class AsyncBridgeService:
                             status_map[node_id] = f'PLC read failed for {address_label}: {read_status}'
                             failed_count += 1
                             continue
-                        node = opcua_client.get_node(node_id)
-                        variant_type = node.get_data_type_as_variant_type()
-                        scada_value = node.get_value()
+                        node = _DeferredScadaWrite(node_id, scada_writes)
+                        variant_type = variant_types.get(node_id)
+                        scada_value = scada_values.get(node_id)
                         snapshot = snapshot_map.get(node_id, {}) if isinstance(snapshot_map, dict) else {}
                         has_snapshot = isinstance(snapshot, dict) and 'plc_value' in snapshot and 'scada_value' in snapshot
 
@@ -1829,6 +2047,14 @@ class AsyncBridgeService:
                         status_map[node_id] = f'Sync failed: {exc}'
                         failed_count += 1
 
+            write_errors = self._opcua_write_values(opcua_client, scada_writes)
+            for node_id, error in write_errors.items():
+                status_map[node_id] = f'SCADA write failed: {error}'
+                failed_count += 1
+                success_count = max(0, success_count - 1)
+                # Force a re-bootstrap for this node on the next cycle.
+                snapshot_map.pop(node_id, None)
+
             bridge['synced_count'] = success_count
             bridge['last_sync_at'] = timezone.localtime().isoformat()
             bridge['last_sync_result'] = (f'Bridge cycle: {success_count} updates, {aligned_count} aligned, {conflict_count} conflicts, {failed_count} failures.')
@@ -1846,11 +2072,11 @@ class AsyncBridgeService:
             payload['runtime'] = {'last_action': 'bridge_monitor_cycle', 'last_message': bridge['last_sync_result']}
         except Exception as exc:
             error_type = type(exc).__name__
+            transport_failure = 'Connection' in error_type or 'Timeout' in error_type or 'refused' in str(exc).lower()
             # Categorize errors for better recovery
-            if 'Connection' in error_type or 'Timeout' in error_type or 'refused' in str(exc).lower():
+            if transport_failure:
                 # Connection errors are transient - mark for retry
                 bridge['last_sync_result'] = f'Connection issue (will retry): {error_type}: {exc}'
-                raise ConnectionError(str(exc)) from exc
             elif 'Memory' in error_type or 'Resource' in error_type:
                 # Resource errors - graceful degradation
                 bridge['last_sync_result'] = f'Resource constraint (reducing scope): {error_type}'
@@ -1858,39 +2084,18 @@ class AsyncBridgeService:
             else:
                 # Unknown errors - log but try to recover
                 bridge['last_sync_result'] = f'Sync cycle error: {error_type}: {exc}'
-            
+
             # Always update status to track attempts
             bridge['last_sync_at'] = timezone.localtime().isoformat()
             bridge['last_sync_status_map'] = status_map if status_map else {node_id: f'Cycle error: {error_type}' for node_id, _, _, _ in normalized_pairs}
             payload['runtime'] = {'last_action': 'bridge_monitor_cycle', 'last_message': bridge['last_sync_result']}
-            
-            # Re-raise connection errors for backoff handling, swallow others
-            if 'Connection' in error_type or 'Timeout' in error_type:
-                # Drop the persistent OPC UA session so the next cycle rebuilds
-                # it; the watch loop tracks unresponsive time for recovery.
+
+            # Re-raise connection errors for backoff handling, swallow others.
+            # Persistent sessions are dropped so the next cycle rebuilds them.
+            if transport_failure:
                 self._disconnect_opcua()
-                raise
-        finally:
-            # The OPC UA client is intentionally kept open across cycles for low
-            # latency; it is only torn down on error (above) or on stop().
-            # Clean up per-cycle PLC/Modbus/Siemens connections created locally.
-            try:
-                if is_siemens and 's7_client' in locals() and s7_client:
-                    try:
-                        s7_client.disconnect()
-                    except:
-                        pass
-            except Exception as e:
-                print(f'[Bridge] Siemens cleanup warning: {e}')
-            
-            try:
-                if is_modbus and 'modbus_client' in locals() and modbus_client:
-                    try:
-                        modbus_client.close()
-                    except:
-                        pass
-            except Exception as e:
-                print(f'[Bridge] Modbus cleanup warning: {e}')
+                self._disconnect_plc_clients()
+                raise ConnectionError(str(exc)) from exc
 
 
 # Initialize global instances
@@ -1959,6 +2164,7 @@ class BridgeManager:
             logix_service=LogixService(pool=pool),
             pool=pool,
             opcua_service=_opcua_service,
+            cycle_phase=(slot - 1) * 0.25,
         )
         return store, bridge
 
@@ -2304,6 +2510,7 @@ class CombinedPageView(View):
             'show_tag_popup': show_tag_popup and has_discovered_tags,
             'bridge_active': self._get_bridge_active(),
             'bridge_result': self._get_bridge_result(),
+            'bridge_poll_ms': self._get_bridge_poll_ms(),
             'active_slot': self.slot,
             'bridge_slots': _bridge_manager.summary(),
             'app_version': APP_VERSION,
@@ -2322,6 +2529,13 @@ class CombinedPageView(View):
             return payload.get('bridge', {}).get('last_sync_result', '')
         except Exception:
             return ''
+
+    def _get_bridge_poll_ms(self):
+        try:
+            interval = self.store.read().get('bridge', {}).get('poll_interval_seconds')
+        except Exception:
+            interval = None
+        return int(round(normalize_poll_interval(interval) * 1000))
 
     @staticmethod
     def _cached_opcua_state(session):
@@ -2587,6 +2801,8 @@ class CombinedPageView(View):
                     dtype_map[node_id] = dt
             request.session[self.BRIDGE_MAP_KEY] = address_map
             request.session[self.BRIDGE_DTYPE_KEY] = dtype_map
+            raw_poll_ms = str(request.POST.get('poll_interval_ms', '')).strip()
+            poll_interval = normalize_poll_interval(float(raw_poll_ms) / 1000.0) if raw_poll_ms.replace('.', '', 1).isdigit() else None
             snapshot_map = self._prune_bridge_snapshot(request.session, address_map)
             pairs = [(node_id, plc_tag) for node_id, plc_tag in address_map.items() if node_id and plc_tag]
             status_map = {node_id: 'Waiting: address is empty.' for node_id, plc_tag in address_map.items() if not plc_tag}
@@ -2621,6 +2837,8 @@ class CombinedPageView(View):
                         bridge['data_type_map'] = dtype_map
                         bridge['mapped_count'] = len(address_map)
                         bridge['last_sync_status_map'] = status_map
+                        if poll_interval is not None:
+                            bridge['poll_interval_seconds'] = poll_interval
                         payload.setdefault('plc', {})['word_swapped'] = request.session.get('last_plc_word_swapped', 'no')
                         # IMPORTANT:
                         # Keep the last cached PLC/scada snapshot across OPC-UA disconnects.
@@ -2652,6 +2870,36 @@ class CombinedPageView(View):
                     request.session['landing_last_sync_at'] = timezone.localtime().isoformat()
                     request.session['landing_last_sync_result'] = f'Bridge activated for {len(pairs)} mappings.'
 
+
+        elif action == 'stop_bridge':
+            if self.bridge:
+                # Stop first so an in-flight cycle cannot re-publish "syncing"
+                # status after we mark the slot inactive.
+                self.bridge.stop()
+
+            def disable_bridge(payload):
+                bridge = payload.setdefault('bridge', {})
+                bridge['active'] = False
+                bridge['opcua_connected'] = False
+                bridge['last_sync_at'] = timezone.localtime().isoformat()
+                bridge['last_sync_result'] = 'Sync stopped. Change settings and start again.'
+                bridge['last_sync_status_map'] = {
+                    node_id: 'Sync stopped.' for node_id in (bridge.get('node_address_map') or {})
+                }
+                payload['runtime'] = {
+                    'last_action': 'bridge_stopped',
+                    'last_message': 'Continuous sync stopped; mappings kept for the next start.',
+                }
+
+            payload = self.store.update(disable_bridge, backup_reason='bridge_stopped')
+            stopped_bridge = payload.get('bridge', {})
+            request.session[self.BRIDGE_STATUS_KEY] = stopped_bridge.get('last_sync_status_map', {})
+            request.session['landing_last_sync_result'] = stopped_bridge.get('last_sync_result', '')
+            messages.success(
+                request,
+                f'Sync stopped for Connection {self.slot}. Update the settings, then press '
+                '"Connect & Start Sync" to resume.',
+            )
 
         elif action == 'refresh_bridge':
             if self.bridge:
