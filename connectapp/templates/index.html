@@ -2070,7 +2070,9 @@
             // Update bridge result text
             var resultEl = document.querySelector('.bridge-result-text');
             if (resultEl && data.result) {
-              resultEl.textContent = 'Last: ' + data.result;
+              var duration = Number(data.cycle_duration_ms);
+              var timing = Number.isFinite(duration) ? ' (' + duration.toFixed(0) + ' ms)' : '';
+              resultEl.textContent = 'Last: ' + data.result + timing;
             }
           })
           .catch(function() { /* transient failure: the next poll retries */ })

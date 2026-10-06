@@ -3,6 +3,7 @@ import re
 import struct
 import threading
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -575,6 +576,60 @@ class Snap7Service:
 
     AREA_READ_MAP = {'M': 'mb_read', 'Q': 'ab_read', 'A': 'ab_read', 'I': 'eb_read', 'E': 'eb_read'}
     AREA_WRITE_MAP = {'M': 'mb_write', 'Q': 'ab_write', 'A': 'ab_write', 'I': 'eb_write', 'E': 'eb_write'}
+    MAX_BLOCK_READ_BYTES = 200
+
+    def _read_byte_block(self, client, area, db_number, offset, size):
+        if area == 'DB':
+            return client.db_read(db_number, offset, size)
+        method = self.AREA_READ_MAP.get(area)
+        if method is None:
+            raise ValueError(f'Unknown block-readable area: {area}')
+        return getattr(client, method)(offset, size)
+
+    def read_values(self, client, parsed_by_node):
+        values = {}
+        grouped = {}
+        for node_id, parsed in parsed_by_node.items():
+            if parsed is None:
+                values[node_id] = None
+            elif parsed['area'] in ('C', 'T'):
+                try:
+                    values[node_id] = self._read_area(client, parsed)
+                except Exception:
+                    values[node_id] = None
+            else:
+                key = (parsed['area'], parsed['db_number'])
+                grouped.setdefault(key, []).append((parsed['offset'], parsed['size'], node_id, parsed))
+
+        for (area, db_number), entries in grouped.items():
+            entries.sort(key=lambda item: item[0])
+            blocks = []
+            for entry in entries:
+                offset, size, _, _ = entry
+                entry_end = offset + size
+                if blocks:
+                    block_start, block_end, block_entries = blocks[-1]
+                    combined_end = max(block_end, entry_end)
+                    if offset <= block_end and combined_end - block_start <= self.MAX_BLOCK_READ_BYTES:
+                        blocks[-1] = (block_start, combined_end, block_entries + [entry])
+                        continue
+                blocks.append((offset, entry_end, [entry]))
+
+            for block_start, block_end, block_entries in blocks:
+                try:
+                    data = self._read_byte_block(
+                        client, area, db_number, block_start, block_end - block_start
+                    )
+                    for offset, size, node_id, parsed in block_entries:
+                        relative_offset = offset - block_start
+                        values[node_id] = self._decode_data(
+                            data[relative_offset:relative_offset + size],
+                            parsed['data_type'], parsed['bit'],
+                        )
+                except Exception:
+                    for _, _, node_id, _ in block_entries:
+                        values[node_id] = None
+        return values
 
     def _read_area(self, client, parsed):
         area = parsed['area']
@@ -928,10 +983,14 @@ def _ensure_app_ready():
 
 
 class LandingDataStore:
+    CHECKPOINT_INTERVAL_SECONDS = 2.0
+
     def __init__(self, data_path, backup_dir):
         self.data_path = Path(data_path)
         self.backup_dir = Path(backup_dir)
         self._lock = threading.Lock()
+        self._payload = None
+        self._last_checkpoint = 0.0
 
     def _timestamp(self):
         return timezone.now().astimezone(timezone.get_current_timezone()).isoformat()
@@ -955,20 +1014,23 @@ class LandingDataStore:
         }
 
     def _read_unlocked(self):
+        if self._payload is not None:
+            return self._payload
         if not self.data_path.exists():
-            return self.default_payload()
+            self._payload = self.default_payload()
+            return self._payload
         try:
             with self.data_path.open('r', encoding='utf-8') as handle:
                 payload = json.load(handle)
             if isinstance(payload, dict):
-                return payload
+                self._payload = payload
+                return self._payload
         except Exception:
             pass
-        return self.default_payload()
+        self._payload = self.default_payload()
+        return self._payload
 
     def read(self):
-        # Read-only: rewriting on every read made the status API and page render
-        # contend with the bridge for this lock (and the disk) many times a second.
         with self._lock:
             payload = self._read_unlocked()
             if not self.data_path.exists():
@@ -976,23 +1038,33 @@ class LandingDataStore:
                     self._write_unlocked(payload)
                 except OSError:
                     pass
-            return payload
+            return deepcopy(payload)
 
     def _write_unlocked(self, payload):
         payload['updated_at'] = self._timestamp()
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.data_path.open('w', encoding='utf-8') as handle:
+        temporary_path = self.data_path.with_suffix(self.data_path.suffix + '.tmp')
+        with temporary_path.open('w', encoding='utf-8') as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=True)
             handle.write('\n')
+        temporary_path.replace(self.data_path)
+        self._last_checkpoint = perf_counter()
 
-    def update(self, mutate_callback, backup_reason=None):
+    def update(self, mutate_callback, backup_reason=None, persist=True):
         with self._lock:
             payload = self._read_unlocked()
             mutate_callback(payload)
-            self._write_unlocked(payload)
+            checkpoint_due = perf_counter() - self._last_checkpoint >= self.CHECKPOINT_INTERVAL_SECONDS
+            if persist or backup_reason or checkpoint_due:
+                self._write_unlocked(payload)
             if backup_reason:
                 self._create_backup_unlocked(payload, backup_reason)
-            return payload
+            return deepcopy(payload)
+
+    def flush(self):
+        with self._lock:
+            if self._payload is not None:
+                self._write_unlocked(self._payload)
 
     def _create_backup_unlocked(self, payload, reason):
         payload.setdefault('backup', {})
@@ -1058,7 +1130,7 @@ class AsyncBridgeService:
         'synced_count', 'last_sync_at', 'last_sync_result', 'last_sync_status_map',
         'last_sync_snapshot', 'opcua_connected', 'opcua_reconnect_epoch',
         'opcua_reconnect_recovering', 'opcua_reconnect_recovery_cycles',
-        'opcua_server_start_time',
+        'opcua_server_start_time', 'last_cycle_duration_ms',
     )
 
     def __init__(self, store, logix_service, pool, opcua_service, cycle_phase=0.0):
@@ -1135,6 +1207,74 @@ class AsyncBridgeService:
         return func, int(address)
 
     @staticmethod
+    def _modbus_read_values(client, normalized_pairs, data_type_map, word_swapped):
+        function_aliases = {
+            'holding': 'holding', 'reg': 'holding', 'register': 'holding',
+            'coil': 'coil',
+            'input': 'input', 'input_register': 'input', 'input_registers': 'input',
+            'discrete_input': 'discrete', 'discrete': 'discrete', 'input_discrete': 'discrete',
+        }
+        limits = {'holding': 125, 'input': 125, 'coil': 2000, 'discrete': 2000}
+        grouped = {function: [] for function in limits}
+        values = {}
+
+        for node_id, _, original_tag, _ in normalized_pairs:
+            try:
+                raw_function, address = AsyncBridgeService._parse_modbus_tag(original_tag)
+                function = function_aliases.get(raw_function, 'holding')
+                address, _ = PymodbusService._to_modbus_offset(raw_function, address)
+                data_type = data_type_map.get(node_id, 'uint16')
+                count = 1 if function in ('coil', 'discrete') else PymodbusService._register_count(data_type)
+                grouped[function].append((address, count, node_id, data_type))
+            except (TypeError, ValueError):
+                values[node_id] = None
+
+        for function, entries in grouped.items():
+            entries.sort(key=lambda item: item[0])
+            blocks = []
+            for entry in entries:
+                address, count, _, _ = entry
+                entry_end = address + count
+                if blocks:
+                    block_start, block_end, block_entries = blocks[-1]
+                    combined_end = max(block_end, entry_end)
+                    if address <= block_end and combined_end - block_start <= limits[function]:
+                        blocks[-1] = (block_start, combined_end, block_entries + [entry])
+                        continue
+                blocks.append((address, entry_end, [entry]))
+
+            for block_start, block_end, block_entries in blocks:
+                block_count = block_end - block_start
+                try:
+                    if function == 'holding':
+                        result = client.read_holding_registers(block_start, count=block_count, device_id=1)
+                    elif function == 'coil':
+                        result = client.read_coils(block_start, count=block_count, device_id=1)
+                    elif function == 'input':
+                        result = client.read_input_registers(block_start, count=block_count, device_id=1)
+                    else:
+                        result = client.read_discrete_inputs(block_start, count=block_count, device_id=1)
+                    if PymodbusService._is_error_response(result):
+                        raise OSError('Modbus block read returned an error response.')
+
+                    registers = getattr(result, 'registers', None)
+                    bits = getattr(result, 'bits', None)
+                    for address, count, node_id, data_type in block_entries:
+                        offset = address - block_start
+                        if registers is not None:
+                            values[node_id] = PymodbusService._decode_registers(
+                                registers[offset:offset + count], data_type, word_swapped=word_swapped
+                            )
+                        elif bits is not None:
+                            values[node_id] = bool(bits[offset])
+                        else:
+                            values[node_id] = None
+                except Exception:
+                    for _, _, node_id, _ in block_entries:
+                        values[node_id] = None
+        return values
+
+    @staticmethod
     def _coerce_for_variant(value, variant_type):
         if value is None:
             return None
@@ -1188,6 +1328,7 @@ class AsyncBridgeService:
                     print('[Bridge] WARNING: Bridge thread did not stop cleanly (will be terminated)')
             self._disconnect_opcua()
             self._disconnect_plc_clients()
+            self.store.flush()
             print('[Bridge] Shutdown complete')
 
     def _disconnect_opcua(self):
@@ -1506,10 +1647,14 @@ class AsyncBridgeService:
         # the PLC/OPC round trips blocked the status API and every page render,
         # which is what made a third concurrent slot feel unusable.
         with self._cycle_lock:
+            cycle_started = perf_counter()
             payload = self.store.read()
             try:
                 self._sync_payload(payload, force_plc_to_scada=force_plc_to_scada)
             finally:
+                payload.setdefault('bridge', {})['last_cycle_duration_ms'] = round(
+                    (perf_counter() - cycle_started) * 1000, 1
+                )
                 self._commit_cycle(payload)
             return payload
 
@@ -1530,7 +1675,7 @@ class AsyncBridgeService:
                 current['runtime'] = runtime
 
         try:
-            self.store.update(mutate)
+            self.store.update(mutate, persist=False)
         except Exception as exc:
             print(f'[Bridge] Failed to persist cycle result: {exc}')
 
@@ -1634,13 +1779,28 @@ class AsyncBridgeService:
             read_ids = list(node_ids)
             if _OPCUA_SERVER_START_TIME_NODE not in read_ids:
                 read_ids.append(_OPCUA_SERVER_START_TIME_NODE)
+            logix_plc = None
+            logix_read_results = None
             try:
                 variant_types = self._opcua_variant_types(opcua_client, node_ids)
-                scada_values = self._opcua_read_values(opcua_client, read_ids)
+                if not is_modbus and not is_siemens:
+                    logix_plc = self.pool.get(internal_path)
+                    if not logix_plc.connected:
+                        raise ConnectionError(f'Unable to connect to PLC at {display_path}')
+                    plc_tags = [normalized_tag for _, normalized_tag, _, _ in normalized_pairs]
+                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='bridge-read') as executor:
+                        scada_future = executor.submit(self._opcua_read_values, opcua_client, read_ids)
+                        plc_future = executor.submit(logix_plc.read, *plc_tags)
+                        scada_values = scada_future.result()
+                        logix_read_results = plc_future.result()
+                else:
+                    scada_values = self._opcua_read_values(opcua_client, read_ids)
             except Exception as e:
                 bridge['opcua_connected'] = False
                 self._disconnect_opcua()
-                raise ConnectionError(f'OPC UA connection is not responsive: {e}') from e
+                if not is_modbus and not is_siemens:
+                    self.pool.invalidate(internal_path)
+                raise ConnectionError(f'PLC/OPC UA read failed: {e}') from e
 
             now_connected = True
 
@@ -1714,14 +1874,23 @@ class AsyncBridgeService:
                 except Exception as e:
                     raise ConnectionError(f'Siemens connection error: {e}') from e
                 try:
+                    parsed_by_node = {
+                        node_id: _snap7_service._parse_address(normalized_tag)
+                        for node_id, normalized_tag, _, _ in normalized_pairs
+                    }
+                    plc_values = _snap7_service.read_values(s7_client, parsed_by_node)
                     for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
                         try:
-                            parsed = _snap7_service._parse_address(normalized_tag)
+                            parsed = parsed_by_node.get(node_id)
                             if parsed is None:
                                 status_map[node_id] = f'Invalid Siemens address: {address_label}'
                                 failed_count += 1
                                 continue
-                            plc_value = _snap7_service._read_area(s7_client, parsed)
+                            plc_value = plc_values.get(node_id)
+                            if plc_value is None:
+                                status_map[node_id] = f'PLC read failed for {address_label}'
+                                failed_count += 1
+                                continue
                             node = _DeferredScadaWrite(node_id, scada_writes)
                             variant_type = variant_types.get(node_id)
                             scada_value = scada_values.get(node_id)
@@ -1817,40 +1986,12 @@ class AsyncBridgeService:
                 except Exception as e:
                     raise ConnectionError(f'Modbus connection error: {e}') from e
                 try:
-                    read_map = {}
-                    for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
-                        try:
-                            func, addr = self._parse_modbus_tag(original_tag)
-                            addr, label = PymodbusService._to_modbus_offset(func, addr)
-                            tag_dtype = data_type_map.get(node_id, 'uint16')
-                            count = PymodbusService._register_count(tag_dtype)
-
-                            if func in ('holding', 'reg', 'register'):
-                                result = modbus_client.read_holding_registers(addr, count=count, device_id=1)
-
-                            elif func == 'coil':
-                                result = modbus_client.read_coils(addr, count=1, device_id=1)
-                            elif func in ('input', 'input_register', 'input_registers'):
-                                result = modbus_client.read_input_registers(addr, count=count, device_id=1)
-                            elif func in ('discrete_input', 'discrete', 'input_discrete'):
-                                result = modbus_client.read_discrete_inputs(addr, count=1, device_id=1)
-                            else:
-                                result = modbus_client.read_holding_registers(addr, count=count, device_id=1)
-                            if PymodbusService._is_error_response(result):
-                                read_map[node_id] = None
-                            else:
-                                regs = getattr(result, 'registers', None)
-                                bits = getattr(result, 'bits', None)
-                                if regs is not None:
-                                    word_swapped = str(payload.get('plc', {}).get('word_swapped', 'false') or 'false').strip().lower() in ('1','true','yes','y','on')
-                                    read_map[node_id] = PymodbusService._decode_registers(regs, tag_dtype, word_swapped=word_swapped)
-
-                                elif bits is not None:
-                                    read_map[node_id] = bits[0] if bits else None
-                                else:
-                                    read_map[node_id] = None
-                        except Exception:
-                            read_map[node_id] = None
+                    word_swapped = str(
+                        payload.get('plc', {}).get('word_swapped', 'false') or 'false'
+                    ).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                    read_map = self._modbus_read_values(
+                        modbus_client, normalized_pairs, data_type_map, word_swapped
+                    )
 
                     for node_id, normalized_tag, original_tag, address_label in normalized_pairs:
                         try:
@@ -1962,14 +2103,9 @@ class AsyncBridgeService:
                     self._disconnect_plc_clients()
                     raise
             else:
-                plc = self.pool.get(internal_path)
-                try:
-                    if not plc.connected:
-                        raise ConnectionError(f'Unable to connect to PLC at {display_path}')
-                except Exception as e:
-                    raise ConnectionError(f'PLC connection error: {e}') from e
+                plc = logix_plc
                 plc_tags = [normalized_tag for _, normalized_tag, _, _ in normalized_pairs]
-                read_results = plc.read(*plc_tags) if plc_tags else []
+                read_results = logix_read_results if plc_tags else []
                 if plc_tags and not isinstance(read_results, list):
                     read_results = [read_results]
                 read_map = {tag_name: result for tag_name, result in zip(plc_tags, read_results)}
@@ -2233,6 +2369,7 @@ def bridge_status_api(request):
             'active': bool(bridge.get('active', False)),
             'result': bridge.get('last_sync_result', ''),
             'sync_at': bridge.get('last_sync_at', ''),
+            'cycle_duration_ms': bridge.get('last_cycle_duration_ms'),
             'status_map': status_map,
         })
     except Exception as exc:
