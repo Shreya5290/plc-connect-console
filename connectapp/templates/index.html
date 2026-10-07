@@ -1290,7 +1290,7 @@
         <h1>Click2Connect</h1>
       </header>
 
-      <!-- Connection slot tabs: up to 3 concurrent PLC<->SCADA sessions -->
+      <!-- Connection slot tabs: up to 4 concurrent PLC<->SCADA sessions -->
       <nav class="slot-tabs" aria-label="Connection sessions">
         {% for s in bridge_slots %}
           <a class="slot-tab{% if s.slot == active_slot %} is-active{% endif %}" href="?slot={{ s.slot }}">

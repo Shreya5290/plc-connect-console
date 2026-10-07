@@ -19,6 +19,8 @@ from django.views import View
 from django.views.decorators.http import require_GET
 from pycomm3 import LogixDriver, Tag
 from pymodbus.client import ModbusTcpClient
+from pymodbus.exceptions import ModbusIOException
+from pymodbus.pdu import ExceptionResponse
 
 from .forms import (
     ClearHistoryForm,
@@ -593,10 +595,7 @@ class Snap7Service:
             if parsed is None:
                 values[node_id] = None
             elif parsed['area'] in ('C', 'T'):
-                try:
-                    values[node_id] = self._read_area(client, parsed)
-                except Exception:
-                    values[node_id] = None
+                values[node_id] = self._read_area(client, parsed)
             else:
                 key = (parsed['area'], parsed['db_number'])
                 grouped.setdefault(key, []).append((parsed['offset'], parsed['size'], node_id, parsed))
@@ -616,18 +615,17 @@ class Snap7Service:
                 blocks.append((offset, entry_end, [entry]))
 
             for block_start, block_end, block_entries in blocks:
-                try:
-                    data = self._read_byte_block(
-                        client, area, db_number, block_start, block_end - block_start
-                    )
-                    for offset, size, node_id, parsed in block_entries:
-                        relative_offset = offset - block_start
+                data = self._read_byte_block(
+                    client, area, db_number, block_start, block_end - block_start
+                )
+                for offset, size, node_id, parsed in block_entries:
+                    relative_offset = offset - block_start
+                    try:
                         values[node_id] = self._decode_data(
                             data[relative_offset:relative_offset + size],
                             parsed['data_type'], parsed['bit'],
                         )
-                except Exception:
-                    for _, _, node_id, _ in block_entries:
+                    except (IndexError, TypeError, ValueError, struct.error):
                         values[node_id] = None
         return values
 
@@ -1254,13 +1252,23 @@ class AsyncBridgeService:
                         result = client.read_input_registers(block_start, count=block_count, device_id=1)
                     else:
                         result = client.read_discrete_inputs(block_start, count=block_count, device_id=1)
-                    if PymodbusService._is_error_response(result):
-                        raise OSError('Modbus block read returned an error response.')
+                except Exception as exc:
+                    raise ConnectionError('Modbus block read failed.') from exc
 
-                    registers = getattr(result, 'registers', None)
-                    bits = getattr(result, 'bits', None)
-                    for address, count, node_id, data_type in block_entries:
-                        offset = address - block_start
+                if isinstance(result, ModbusIOException):
+                    raise ConnectionError('Modbus PLC did not respond.')
+                if isinstance(result, ExceptionResponse):
+                    for _, _, node_id, _ in block_entries:
+                        values[node_id] = None
+                    continue
+                if PymodbusService._is_error_response(result):
+                    raise ConnectionError('Modbus block read returned a transport error.')
+
+                registers = getattr(result, 'registers', None)
+                bits = getattr(result, 'bits', None)
+                for address, count, node_id, data_type in block_entries:
+                    offset = address - block_start
+                    try:
                         if registers is not None:
                             values[node_id] = PymodbusService._decode_registers(
                                 registers[offset:offset + count], data_type, word_swapped=word_swapped
@@ -1269,8 +1277,7 @@ class AsyncBridgeService:
                             values[node_id] = bool(bits[offset])
                         else:
                             values[node_id] = None
-                except Exception:
-                    for _, _, node_id, _ in block_entries:
+                    except (IndexError, TypeError, ValueError, struct.error):
                         values[node_id] = None
         return values
 
@@ -2251,14 +2258,14 @@ if _init_payload.get('bridge', {}).get('active'):
 del _init_payload
 
 
-MAX_BRIDGE_SLOTS = 3
+MAX_BRIDGE_SLOTS = 4
 
 
 def _store_path_for_slot(slot):
     """Return the (data_file, backup_dir) for a bridge slot.
 
     Slot 1 reuses the original files so existing deployments keep working;
-    slots 2 and 3 get their own independent files.
+    all additional slots get their own independent files.
     """
     if slot == 1:
         return _LANDING_DATA_FILE, _LANDING_BACKUP_DIR
@@ -2272,7 +2279,7 @@ class BridgeManager:
     """Owns up to MAX_BRIDGE_SLOTS independent PLC<->SCADA bridges.
 
     Each slot has its own JSON store, its own OPC UA/PLC connections and its own
-    background thread, so up to three connections can run concurrently without
+    background thread, so up to four connections can run concurrently without
     interfering with each other. Slot 1 reuses the original global store/bridge
     for full backward compatibility.
     """
