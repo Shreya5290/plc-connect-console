@@ -30,6 +30,7 @@ from .forms import (
     PlcConfigSaveForm,
     PlcReadForm,
 )
+from .sql_logger import SqlServerDataLogger
 
 try:
     from opcua import Client as OpcUaClient, ua
@@ -1131,11 +1132,13 @@ class AsyncBridgeService:
         'opcua_server_start_time', 'last_cycle_duration_ms',
     )
 
-    def __init__(self, store, logix_service, pool, opcua_service, cycle_phase=0.0):
+    def __init__(self, store, logix_service, pool, opcua_service, cycle_phase=0.0, sql_logger=None, bridge_slot=1):
         self.store = store
         self.logix_service = logix_service
         self.pool = pool
         self.opcua_service = opcua_service
+        self.sql_logger = sql_logger
+        self.bridge_slot = bridge_slot
         self._thread = None
         self._guard = threading.Lock()
         self._stop_event = threading.Event()
@@ -1192,6 +1195,32 @@ class AsyncBridgeService:
         if isinstance(left, dict) and isinstance(right, dict) and set(left.keys()) == set(right.keys()):
             return all(AsyncBridgeService._values_match(left[key], right[key]) for key in left)
         return left == right
+
+    def _log_cycle_values(self, payload, snapshot_map, previous_sync_times):
+        if self.sql_logger is None:
+            return
+        plc = payload.get('plc') or {}
+        bridge = payload.get('bridge') or {}
+        data_type_map = bridge.get('data_type_map') or {}
+        records = []
+        for node_id, snapshot in snapshot_map.items():
+            if not isinstance(snapshot, dict):
+                continue
+            synced_at = snapshot.get('synced_at')
+            if not synced_at or synced_at == previous_sync_times.get(node_id):
+                continue
+            records.append({
+                'recorded_at': synced_at,
+                'bridge_slot': self.bridge_slot,
+                'plc_brand': str(plc.get('brand') or 'allen_bradley'),
+                'plc_connection': str(plc.get('connection_path') or ''),
+                'tag_address': str(snapshot.get('plc_tag') or ''),
+                'opcua_node_id': str(node_id),
+                'value': snapshot.get('plc_value'),
+                'scada_value': snapshot.get('scada_value'),
+                'data_type': str(data_type_map.get(node_id) or ''),
+            })
+        self.sql_logger.enqueue(records)
 
     @staticmethod
     def _parse_modbus_tag(plc_tag):
@@ -1688,6 +1717,9 @@ class AsyncBridgeService:
 
     def _sync_payload(self, payload, force_plc_to_scada=False):
         bridge = payload.setdefault('bridge', {})
+        sql_config = payload.get('sql_logging')
+        if self.sql_logger is not None and isinstance(sql_config, dict):
+            self.sql_logger.configure(sql_config)
         bridge.setdefault('mode', 'json_async_bridge')
         bridge.setdefault('active', False)
         bridge.setdefault('poll_interval_seconds', DEFAULT_POLL_INTERVAL)
@@ -1720,6 +1752,11 @@ class AsyncBridgeService:
         # Treat malformed/empty snapshot as disabled for restore decisions.
         if not isinstance(snapshot_map, dict):
             snapshot_map = {}
+        previous_sync_times = {
+            node_id: snapshot.get('synced_at')
+            for node_id, snapshot in snapshot_map.items()
+            if isinstance(snapshot, dict)
+        }
 
         if not endpoint:
             bridge['active'] = False
@@ -2198,6 +2235,7 @@ class AsyncBridgeService:
                 # Force a re-bootstrap for this node on the next cycle.
                 snapshot_map.pop(node_id, None)
 
+            self._log_cycle_values(payload, snapshot_map, previous_sync_times)
             bridge['synced_count'] = success_count
             bridge['last_sync_at'] = timezone.localtime().isoformat()
             bridge['last_sync_result'] = (f'Bridge cycle: {success_count} updates, {aligned_count} aligned, {conflict_count} conflicts, {failed_count} failures.')
@@ -2244,12 +2282,15 @@ class AsyncBridgeService:
 # Initialize global instances
 _landing_store = LandingDataStore(_LANDING_DATA_FILE, _LANDING_BACKUP_DIR)
 _landing_store.read()
+_default_sql_logging_config = getattr(settings, 'SQL_SERVER_LOGGING', {})
 
 _async_bridge = AsyncBridgeService(
     store=_landing_store,
     logix_service=_logix_service,
     pool=_logix_pool,
     opcua_service=_opcua_service,
+    sql_logger=SqlServerDataLogger(_default_sql_logging_config),
+    bridge_slot=1,
 )
 
 _init_payload = _landing_store.read()
@@ -2308,6 +2349,8 @@ class BridgeManager:
             pool=pool,
             opcua_service=_opcua_service,
             cycle_phase=(slot - 1) * 0.25,
+            sql_logger=SqlServerDataLogger(_default_sql_logging_config),
+            bridge_slot=slot,
         )
         return store, bridge
 
@@ -2657,6 +2700,7 @@ class CombinedPageView(View):
             'bridge_poll_ms': self._get_bridge_poll_ms(),
             'active_slot': self.slot,
             'bridge_slots': _bridge_manager.summary(),
+            'sql_logging': self._get_sql_logging_context(),
             'app_version': APP_VERSION,
         }
 
@@ -2680,6 +2724,51 @@ class CombinedPageView(View):
         except Exception:
             interval = None
         return int(round(normalize_poll_interval(interval) * 1000))
+
+    def _get_sql_logging_context(self):
+        try:
+            config = self.store.read().get('sql_logging') or {}
+        except Exception:
+            config = {}
+        authentication = str(config.get('authentication') or 'windows').strip().lower()
+        if authentication not in ('windows', 'sql'):
+            authentication = 'windows'
+        return {
+            'enabled': SqlServerDataLogger._is_enabled(config.get('enabled')),
+            'server': str(config.get('server') or ''),
+            'database': str(config.get('database') or ''),
+            'authentication': authentication,
+            'username': str(config.get('username') or ''),
+            'password_saved': bool(config.get('password')),
+            'driver': str(config.get('driver') or 'ODBC Driver 18 for SQL Server'),
+            'table_name': str(config.get('table_name') or 'PlcDataLog'),
+            'encrypt': SqlServerDataLogger._is_enabled(config.get('encrypt', True)),
+            'trust_server_certificate': SqlServerDataLogger._is_enabled(config.get('trust_server_certificate')),
+        }
+
+    def _sql_config_from_post(self, request):
+        try:
+            existing = self.store.read().get('sql_logging') or {}
+        except Exception:
+            existing = {}
+        authentication = str(request.POST.get('sql_authentication') or 'windows').strip().lower()
+        if authentication not in ('windows', 'sql'):
+            authentication = 'windows'
+        password = request.POST.get('sql_password', '')
+        if not password:
+            password = existing.get('password', '')
+        return {
+            'enabled': request.POST.get('sql_enabled') == 'on',
+            'server': str(request.POST.get('sql_server') or '').strip(),
+            'database': str(request.POST.get('sql_database') or '').strip(),
+            'authentication': authentication,
+            'username': str(request.POST.get('sql_username') or '').strip(),
+            'password': password,
+            'driver': str(request.POST.get('sql_driver') or 'ODBC Driver 18 for SQL Server').strip(),
+            'table_name': str(request.POST.get('sql_table_name') or 'PlcDataLog').strip(),
+            'encrypt': request.POST.get('sql_encrypt') == 'on',
+            'trust_server_certificate': request.POST.get('sql_trust_server_certificate') == 'on',
+        }
 
     @staticmethod
     def _cached_opcua_state(session):
@@ -2792,7 +2881,34 @@ class CombinedPageView(View):
         plc_config_load_form = PlcConfigLoadForm(file_choices=self._config_file_choices())
         plc_config_import_form = PlcConfigImportForm()
 
-        if action == 'plc_read':
+        if action in ('save_sql_logging', 'test_sql_logging'):
+            sql_config = self._sql_config_from_post(request)
+            validation_config = dict(sql_config)
+            if action == 'test_sql_logging':
+                validation_config['enabled'] = True
+            error = SqlServerDataLogger.validate_config(validation_config)
+            if error:
+                messages.error(request, error)
+            elif action == 'test_sql_logging':
+                try:
+                    self.bridge.sql_logger.test_configuration(validation_config)
+                    messages.success(request, 'SQL Server connection and table permissions are valid.')
+                except Exception as exc:
+                    messages.error(request, f'SQL Server connection test failed: {exc}')
+            else:
+                def save_sql_logging(payload):
+                    payload['sql_logging'] = sql_config
+                    payload['runtime'] = {
+                        'last_action': 'sql_logging_saved',
+                        'last_message': 'SQL Server logging settings updated.',
+                    }
+
+                self.store.update(save_sql_logging, backup_reason='sql_logging_saved')
+                self.bridge.sql_logger.configure(sql_config)
+                status = 'enabled' if sql_config.get('enabled') else 'disabled'
+                messages.success(request, f'SQL Server data logging {status} for Connection {self.slot}.')
+
+        elif action == 'plc_read':
             plc_form = PlcReadForm(request.POST)
             if plc_form.is_valid():
                 plc_ip = plc_form.cleaned_data['plc_ip']

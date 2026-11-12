@@ -332,10 +332,43 @@
     .card--plc{border-top:4px solid #1a7f8f}
     .card--opcua{border-top:4px solid #50c878}
     .card--map{border-top:4px solid #8b5cf6}
+    .card--sql{border-top:4px solid #d97706}
 
     .card--plc .title-chip{background:#c9e8ed;color:#0d5f6f;border-color:#7fc4d3}
     .card--opcua .title-chip{background:#e8f9f0;color:#00a86b;border-color:#b3e5d0}
     .card--map .title-chip{background:#f0e6ff;color:#8b5cf6;border-color:#d0bfff}
+    .card--sql .title-chip{background:#fff2d8;color:#9a4d00;border-color:#f2c36b}
+
+    .sql-settings-grid{
+      display:grid;
+      grid-template-columns:repeat(3,minmax(0,1fr));
+      gap:0 14px;
+    }
+    .sql-settings-grid .field{min-width:0}
+    .sql-settings-grid .span-2{grid-column:span 2}
+    .sql-credential-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .sql-option-row{
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      gap:18px;
+      margin:14px 0 4px;
+    }
+    .sql-check{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      margin:0;
+      cursor:pointer;
+    }
+    .sql-check input[type="checkbox"]{
+      width:18px;
+      height:18px;
+      margin:0;
+      padding:0;
+      accent-color:var(--brand);
+    }
+    .sql-password-note{font-size:.76rem;color:var(--muted);margin-top:5px}
 
     h2{
       margin:0;
@@ -1197,6 +1230,7 @@
       .plc-conn-row{grid-template-columns:1fr}
       .opcua-conn-row{grid-template-columns:2fr 1fr}
       .tag-meta{grid-template-columns:1fr}
+      .sql-settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
     }
 
     @media (max-width:700px){
@@ -1208,6 +1242,10 @@
       .modbus-tool-row{grid-template-columns:1fr}
       .tag-item-head{grid-template-columns:auto 1fr}
       .tag-toggle{grid-column:2;justify-self:start}
+      .sql-settings-grid,.sql-credential-grid{grid-template-columns:1fr}
+      .sql-settings-grid .span-2{grid-column:auto}
+      .sql-option-row{align-items:flex-start;flex-direction:column;gap:10px}
+      .action-row .btn{width:100%}
     }
 
     /* Connection slot tabs (multi-session support) */
@@ -1575,6 +1613,75 @@
           </div>
         </form>
         </section>
+
+        <section class="card card--sql" style="width:100%;margin:0;">
+          <div class="card-title">
+            <span class="title-chip">Historian</span>
+            <h2>Microsoft SQL Server Logging</h2>
+          </div>
+          <form method="POST" novalidate id="sql-settings-form">
+            {% csrf_token %}
+            <input type="hidden" name="slot" value="{{ active_slot }}">
+            <div class="sql-option-row">
+              <label class="sql-check">
+                <input type="checkbox" name="sql_enabled"{% if sql_logging.enabled %} checked{% endif %}>
+                Log successful bridge values to SQL Server
+              </label>
+            </div>
+            <div class="sql-settings-grid">
+              <div class="field span-2">
+                <label for="sql-server">Server or instance</label>
+                <input id="sql-server" type="text" name="sql_server" value="{{ sql_logging.server }}" placeholder="SQLSERVER01 or 10.0.0.10\SQLEXPRESS" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="sql-database">Database</label>
+                <input id="sql-database" type="text" name="sql_database" value="{{ sql_logging.database }}" placeholder="Click2Connect" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="sql-authentication">Authentication</label>
+                <select id="sql-authentication" name="sql_authentication">
+                  <option value="windows"{% if sql_logging.authentication == 'windows' %} selected{% endif %}>Windows authentication</option>
+                  <option value="sql"{% if sql_logging.authentication == 'sql' %} selected{% endif %}>SQL Server authentication</option>
+                </select>
+              </div>
+              <div id="sql-credentials" class="field span-2"{% if sql_logging.authentication != 'sql' %} hidden{% endif %}>
+                <div class="sql-settings-grid sql-credential-grid">
+                  <div class="field">
+                    <label for="sql-username">Username</label>
+                    <input id="sql-username" type="text" name="sql_username" value="{{ sql_logging.username }}" autocomplete="username">
+                  </div>
+                  <div class="field">
+                    <label for="sql-password">Password</label>
+                    <input id="sql-password" type="password" name="sql_password" value="" placeholder="{% if sql_logging.password_saved %}Saved - leave blank to keep{% else %}Enter SQL password{% endif %}" autocomplete="new-password">
+                    {% if sql_logging.password_saved %}<div class="sql-password-note">A password is saved for this connection.</div>{% endif %}
+                  </div>
+                </div>
+              </div>
+              <div class="field">
+                <label for="sql-driver">ODBC driver</label>
+                <input id="sql-driver" type="text" name="sql_driver" value="{{ sql_logging.driver }}" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="sql-table">Table name</label>
+                <input id="sql-table" type="text" name="sql_table_name" value="{{ sql_logging.table_name }}" pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off">
+              </div>
+            </div>
+            <div class="sql-option-row">
+              <label class="sql-check">
+                <input type="checkbox" name="sql_encrypt"{% if sql_logging.encrypt %} checked{% endif %}>
+                Encrypt connection
+              </label>
+              <label class="sql-check">
+                <input type="checkbox" name="sql_trust_server_certificate"{% if sql_logging.trust_server_certificate %} checked{% endif %}>
+                Trust server certificate
+              </label>
+            </div>
+            <div class="action-row">
+              <button class="btn" type="submit" name="action" value="test_sql_logging">Test Connection</button>
+              <button class="btn primary" type="submit" name="action" value="save_sql_logging">Save SQL Settings</button>
+            </div>
+          </form>
+        </section>
       </div>
     <style>
       .select-mode .select-col input[type="checkbox"] {
@@ -1592,6 +1699,18 @@
         var removeSelectedForm = document.getElementById('remove-selected-form');
         var removeSelectedWrap = document.getElementById('remove-selected-confirm-wrap');
         var selectAll = document.getElementById('select-all-rows');
+        var sqlAuthentication = document.getElementById('sql-authentication');
+        var sqlCredentials = document.getElementById('sql-credentials');
+
+        function updateSqlAuthenticationFields() {
+          if (sqlAuthentication && sqlCredentials) {
+            sqlCredentials.hidden = sqlAuthentication.value !== 'sql';
+          }
+        }
+        if (sqlAuthentication) {
+          sqlAuthentication.addEventListener('change', updateSqlAuthenticationFields);
+          updateSqlAuthenticationFields();
+        }
 
         // Intercept form submission for remove_selected_tags to remove excess fields
         if (removeSelectedForm) {

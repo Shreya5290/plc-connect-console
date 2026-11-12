@@ -69,6 +69,38 @@ On first run, the app will automatically:
 
 ---
 
+## Microsoft SQL Server Data Logging (Optional)
+
+The bridge can log every successfully handled PLC value without delaying PLC/SCADA communication. Logging is disabled by default.
+
+1. Install **Microsoft ODBC Driver 18 for SQL Server** on the computer running Click2Connect.
+2. Give the SQL user permission to connect to the database and create/insert into tables.
+3. Open the required **Connection** tab and find **Microsoft SQL Server Logging** below the mapping table.
+4. Enter the server, database, authentication, ODBC driver, and table name. Use **Test Connection** to verify access.
+5. Enable logging and select **Save SQL Settings**. Settings are stored independently for each connection slot.
+
+The saved password is never displayed in the UI. Leave the password field blank when editing other settings to retain the existing password.
+
+For unattended deployments, the following environment variables remain available as fallback defaults. Set them before starting Click2Connect:
+
+```powershell
+setx C2C_SQL_ENABLED "true"
+setx C2C_SQL_CONNECTION_STRING "DRIVER={ODBC Driver 18 for SQL Server};SERVER=SQLSERVER;DATABASE=Click2Connect;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes"
+setx C2C_SQL_TABLE "PlcDataLog"
+```
+
+The table is created automatically on the first write. Each row includes the timestamp, bridge slot, PLC brand and connection, tag or Modbus address, OPC UA node ID, PLC value, SCADA value, and configured data type.
+
+Optional tuning variables are `C2C_SQL_BATCH_SIZE` (default `250`) and `C2C_SQL_QUEUE_SIZE` (default `10000`). If SQL Server is unavailable, the independent logger retries while the bridge continues running. Once the bounded queue is full, new log rows are dropped rather than interrupting PLC communication.
+
+To disable logging:
+
+```powershell
+setx C2C_SQL_ENABLED "false"
+```
+
+---
+
 ## 📋 File Structure in Portable Build
 
 ```

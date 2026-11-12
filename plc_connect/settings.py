@@ -175,3 +175,14 @@ BRIDGE_CONFIG = {
     'read_timeout': 4.0,  # Read operation timeout
     'write_timeout': 4.0,  # Write operation timeout
 }
+
+# Optional Microsoft SQL Server historian. It is disabled unless explicitly
+# enabled, and bridge cycles only enqueue records so database latency cannot
+# delay PLC/SCADA communication.
+SQL_SERVER_LOGGING = {
+    'enabled': os.environ.get('C2C_SQL_ENABLED', '').strip().lower() in ('1', 'true', 'yes', 'on'),
+    'connection_string': os.environ.get('C2C_SQL_CONNECTION_STRING', ''),
+    'table_name': os.environ.get('C2C_SQL_TABLE', 'PlcDataLog'),
+    'batch_size': int(os.environ.get('C2C_SQL_BATCH_SIZE', '250')),
+    'queue_size': int(os.environ.get('C2C_SQL_QUEUE_SIZE', '10000')),
+}

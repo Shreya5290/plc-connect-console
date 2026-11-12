@@ -6,3 +6,4 @@ opcua==0.98.13
 PyYAML==6.0.3
 lxml==6.1.0
 pyinstaller==6.1.0
+pyodbc>=5.2,<6
