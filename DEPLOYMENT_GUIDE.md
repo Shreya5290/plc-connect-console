@@ -54,6 +54,10 @@ C:\Users\a00587102\plc_connect\dist_portable\Click2Connect_v2026.07.10\
    http://localhost:8000
    ```
 
+5. **Click2Connect remains in the Windows notification area**
+   - Double-click the tray icon or choose **Open Click2Connect** to reopen the UI
+   - Choose **Exit Click2Connect** from the tray menu to stop the application
+
 ---
 
 ## ✅ What's Automatic

@@ -3,11 +3,13 @@
 Purpose:
 - Ensure the frozen executable stays alive by explicitly starting Django's server.
 - Disable Django's autoreloader (PyInstaller onefile + reloader can crash).
-- Keep the server running in the terminal without auto-launching a browser.
+- Run from the Windows notification area to prevent accidental closure.
 
 Behavior:
 - Serves the UI at http://127.0.0.1:8000/ locally and binds the server to
   all interfaces for network access.
+- Opens the browser on startup. The tray menu can reopen the UI or explicitly
+  stop Click2Connect.
 
 Robustness:
 - Capture unhandled exceptions into logs/startup_error.log so PyInstaller's
@@ -15,8 +17,14 @@ Robustness:
 """
 
 import os
+import socket
+import threading
 import time
 import traceback
+import webbrowser
+
+
+APP_URL = "http://127.0.0.1:8000/"
 
 
 def _log_error(msg: str) -> None:
@@ -34,6 +42,45 @@ def _log_error(msg: str) -> None:
         pass
 
 
+def _open_browser_when_ready() -> None:
+    """Open the UI only after the local server accepts connections."""
+    for _ in range(100):
+        try:
+            with socket.create_connection(("127.0.0.1", 8000), timeout=0.2):
+                webbrowser.open(APP_URL)
+                return
+        except OSError:
+            time.sleep(0.1)
+
+
+def _start_tray_icon() -> None:
+    """Start the notification-area icon without blocking Django's main thread."""
+    import pystray
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((4, 4, 60, 60), fill=(0, 120, 212, 255))
+    draw.text((21, 14), "C", fill="white", stroke_width=1)
+
+    def open_ui(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        del icon, item
+        webbrowser.open(APP_URL)
+
+    def exit_app(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        del item
+        icon.stop()
+        os._exit(0)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open Click2Connect", open_ui, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit Click2Connect", exit_app),
+    )
+    icon = pystray.Icon("Click2Connect", image, "Click2Connect is running", menu)
+    icon.run_detached()
+
+
 def main() -> int:
     try:
         # Ensure Django settings are discoverable
@@ -46,9 +93,7 @@ def main() -> int:
         # Let onefile extraction finish
         time.sleep(0.2)
 
-        # URL to display for manual browser access.
-        url = "http://127.0.0.1:8000/"
-        print(f"[Startup] UI available at {url}")
+        print(f"[Startup] UI available at {APP_URL}")
 
         # Ensure DB/migrations (including django_session) exist before serving.
         # IMPORTANT: call_command requires Django apps registry to be ready.
@@ -128,6 +173,13 @@ def main() -> int:
                     )
 
         from django.core.management import execute_from_command_line
+
+        _start_tray_icon()
+        threading.Thread(
+            target=_open_browser_when_ready,
+            name="browser-launcher",
+            daemon=True,
+        ).start()
 
         # Bind to all interfaces for connectivity, but still present local URL
         args = [

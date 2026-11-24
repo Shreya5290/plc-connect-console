@@ -85,7 +85,7 @@ def main():
     spec_file = BASE_DIR / f'Click2Connect_v{VERSION}_portable.spec'
     spec_content = f'''# -*- mode: python ; coding: utf-8 -*-
 a = Analysis(
-    ['manage.py'],
+    ['server_entrypoint.py'],
     pathex=[],
     binaries=[],
     datas=[
@@ -121,6 +121,10 @@ a = Analysis(
         'threading',
         'json',
         'yaml',
+        'pystray',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageDraw',
     ],
     hookspath=[],
     runtime_hooks=[],
