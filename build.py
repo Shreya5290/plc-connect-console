@@ -6,8 +6,10 @@ More robust version that handles PyInstaller installation better
 import os
 import sys
 import subprocess
-import shutil
+import tempfile
 from pathlib import Path
+
+from build_support import cleanup_build_artifacts, create_build_version
 
 def run_command(cmd, description, fatal=True):
     """Run a command and handle errors."""
@@ -30,8 +32,9 @@ def run_command(cmd, description, fatal=True):
 def main():
     BASE_DIR = Path(__file__).resolve().parent
     DIST_DIR = BASE_DIR / 'dist_portable'
-    BUILD_DIR = BASE_DIR / 'build_portable'
-    VERSION = (BASE_DIR / 'version.txt').read_text().strip()
+    VERSION = create_build_version(BASE_DIR)
+    EXE_NAME = f'Click2Connect_v{VERSION}'
+    BUILD_DIR = Path(tempfile.gettempdir()) / f'{EXE_NAME}_work'
     
     print(f"\n{'='*60}")
     print(f"  Click2Connect v{VERSION} - Building Portable EXE")
@@ -74,15 +77,8 @@ def main():
     init_file.touch()
     print(f"  ✓ Created")
     
-    # Step 5: Clean old builds
-    print(f"\n[5/6] Cleaning previous builds...")
-    for d in [DIST_DIR, BUILD_DIR]:
-        if d.exists():
-            shutil.rmtree(d)
-    print(f"  ✓ Cleaned")
-    
-    # Create spec file
-    spec_file = BASE_DIR / f'Click2Connect_v{VERSION}_portable.spec'
+    # Step 5: Create spec file
+    spec_file = BASE_DIR / f'{EXE_NAME}_portable.spec'
     spec_content = f'''# -*- mode: python ; coding: utf-8 -*-
 a = Analysis(
     ['server_entrypoint.py'],
@@ -140,7 +136,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Click2Connect_v{VERSION}',
+    name='{EXE_NAME}',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -155,23 +151,26 @@ exe = EXE(
     
     # Step 6: Run PyInstaller
     print(f"\n[6/6] Building portable EXE (2-5 minutes)...")
-    spec_file = BASE_DIR / f'Click2Connect_v{VERSION}_portable.spec'
+    spec_file = BASE_DIR / f'{EXE_NAME}_portable.spec'
     
-    cmd = f'"{sys.executable}" -m PyInstaller "{spec_file}" --distpath "{DIST_DIR}" --workpath "{BUILD_DIR}"'
+    cmd = f'"{sys.executable}" -m PyInstaller "{spec_file}" --noconfirm --distpath "{DIST_DIR}" --workpath "{BUILD_DIR}"'
     result = subprocess.run(cmd, shell=True, capture_output=False, text=True)
     
     if result.returncode == 0:
-        exe_path = DIST_DIR / f'Click2Connect_v{VERSION}' / f'Click2Connect_v{VERSION}.exe'
+        exe_path = DIST_DIR / f'{EXE_NAME}.exe'
         if exe_path.exists():
+            cleanup_errors = cleanup_build_artifacts(BASE_DIR, spec_file, BUILD_DIR)
+            for error in cleanup_errors:
+                print(f"[Build] Cleanup warning: could not remove {error}")
             print(f"\n{'='*60}")
             print(f"  ✓ BUILD SUCCESSFUL!")
             print(f"{'='*60}\n")
             print(f"📦 EXE Location:")
             print(f"   {exe_path}\n")
             print(f"📋 To Deploy:")
-            print(f"   1. Copy: {DIST_DIR / f'Click2Connect_v{VERSION}'}/")
+            print(f"   1. Copy: {exe_path}")
             print(f"   2. Extract on target system")
-            print(f"   3. Run: Click2Connect_v{VERSION}.exe\n")
+            print(f"   3. Run: {EXE_NAME}.exe\n")
         else:
             print(f"\n❌ Build completed but EXE not found at expected location")
             sys.exit(1)

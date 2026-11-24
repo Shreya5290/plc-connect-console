@@ -3,16 +3,18 @@ PyInstaller build script for Click2Connect ONEFILE EXE
 Generates a single standalone executable
 """
 
-import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from build_support import cleanup_build_artifacts, create_build_version
 
 BASE_DIR = Path(__file__).resolve().parent
 DIST_DIR = BASE_DIR / "dist_portable"
-BUILD_DIR = BASE_DIR / "build_portable"
-VERSION = (BASE_DIR / "version.txt").read_text().strip()
-EXE_NAME = f"Click2Connect_{VERSION}"
+VERSION = create_build_version(BASE_DIR)
+EXE_NAME = f"Click2Connect_v{VERSION}"
+BUILD_DIR = Path(tempfile.gettempdir()) / f"{EXE_NAME}_work"
 
 print(f"\n{'='*60}")
 print(f"  Click2Connect {VERSION} - ONEFILE Build")
@@ -41,14 +43,6 @@ try:
 except ImportError as exc:
     print(f"ERROR: Could not load PyInstaller: {exc}")
     sys.exit(1)
-
-# Clean old builds
-print("[Build] Cleaning previous builds...")
-
-for d in [DIST_DIR, BUILD_DIR]:
-    if d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-        print(f"  ✓ Removed {d.name}")
 
 # Create required directories
 print("[Build] Creating app directories...")
@@ -82,7 +76,7 @@ if (BASE_DIR / "db.sqlite3").exists():
 # Important fix: start the Django server explicitly via server_entrypoint.py
 spec_content = f'''# -*- mode: python ; coding: utf-8 -*-\r\n\r\na = Analysis(\r\n    ['server_entrypoint.py'],\r\n    pathex=[],\r\n    binaries=[],\r\n    datas=[\r\n        ('connectapp/templates', 'connectapp/templates'),\r\n        ('connectapp/migrations', 'connectapp/migrations'),\r\n        ('cache', 'cache'),\r\n        ('logs', 'logs'),\r\n        ('version.txt', '.'),\r\n{db_data_entry}    ],\r\n    hiddenimports=[\r\n        'django',\r\n        'django.conf',\r\n        'django.core',\r\n        'django.core.management',\r\n        'django.core.management.commands.runserver',\r\n        'django.db',\r\n        'django.db.backends.sqlite3',\r\n        'django.contrib.admin',\r\n        'django.contrib.auth',\r\n        'django.contrib.contenttypes',\r\n        'django.contrib.sessions',\r\n        'django.contrib.messages',\r\n        'django.contrib.staticfiles',\r\n        'connectapp',\r\n        'connectapp.views',\r\n        'connectapp.forms',\r\n        'connectapp.urls',\r\n        'pycomm3',\r\n        'pymodbus',\r\n        'snap7',\r\n        'opcua',\r\n        'asyncio',\r\n        'threading',\r\n        'json',\r\n        'yaml',\r\n        'pystray',\r\n        'PIL',\r\n        'PIL.Image',\r\n        'PIL.ImageDraw',\r\n    ],\r\n    hookspath=[],\r\n    runtime_hooks=[],\r\n    excludedimports=[],\r\n    noarchive=False,\r\n)\r\n\r\npyz = PYZ(a.pure)\r\n\r\nexe = EXE(\r\n    pyz,\r\n    a.scripts,\r\n    a.binaries,\r\n    a.zipfiles,\r\n    a.datas,\r\n    [],\r\n    name='{EXE_NAME}',\r\n    debug=False,\r\n    bootloader_ignore_signals=False,\r\n    strip=False,\r\n    upx=False,\r\n    console=False,\r\n    disable_windowed_traceback=False,\r\n    icon=['click2connect_icon.ico'],\r\n)\r\n'''
 
-spec_file = BASE_DIR / f"Click2Connect_{VERSION}_portable.spec"
+spec_file = BASE_DIR / f"{EXE_NAME}_portable.spec"
 spec_file.write_text(spec_content, encoding="utf-8")
 
 print(f"  ✓ {spec_file.name}")
@@ -105,6 +99,10 @@ pyinstaller_main.run(
 exe_path = DIST_DIR / f"{EXE_NAME}.exe"
 
 if exe_path.exists():
+    cleanup_errors = cleanup_build_artifacts(BASE_DIR, spec_file, BUILD_DIR)
+    for error in cleanup_errors:
+        print(f"[Build] Cleanup warning: could not remove {error}")
+
     print(f"\n{'='*60}")
     print("  ✓ BUILD SUCCESSFUL!")
     print(f"{'='*60}\n")

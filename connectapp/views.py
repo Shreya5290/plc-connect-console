@@ -6,6 +6,7 @@ from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -919,6 +920,11 @@ def _load_app_version():
     'V1.0', 'v1.0' or '1.0' all render consistently as 'v1.0'.
     """
     version_file = Path(settings.BASE_DIR) / 'version.txt'
+    bundle_dir = getattr(sys, '_MEIPASS', None)
+    if getattr(sys, 'frozen', False) and bundle_dir:
+        bundled_version_file = Path(bundle_dir) / 'version.txt'
+        if bundled_version_file.exists():
+            version_file = bundled_version_file
     raw = ''
     try:
         if version_file.exists():

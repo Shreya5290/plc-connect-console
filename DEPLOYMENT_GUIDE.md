@@ -1,4 +1,4 @@
-# Click2Connect v2026.07.10 - Portable Deployment Guide
+# Click2Connect - Portable Deployment Guide
 
 ## 🚀 Building the Portable EXE
 
@@ -23,10 +23,14 @@ python build_portable.py
 3. **Wait for completion (2-5 minutes)**
    - You'll see compilation progress
    - Final location will be displayed
+   - Each build gets a timestamped version (`vYYYY.MM.DD_HHMMSS`)
+   - `version.txt` is updated to match the generated EXE
+   - Temporary build files and stale timestamped spec files are cleaned after a successful build
+   - Existing EXEs and ZIP archives are retained
 
 4. **Built files location:**
 ```
-C:\Users\a00587102\plc_connect\dist_portable\Click2Connect_v2026.07.10\
+C:\Users\a00587102\plc_connect\dist_portable\Click2Connect_v<TIMESTAMP>.exe
 ```
 
 ---
@@ -35,17 +39,16 @@ C:\Users\a00587102\plc_connect\dist_portable\Click2Connect_v2026.07.10\
 
 ### On Source System (Your PC)
 1. Open `dist_portable/` folder
-2. Copy entire `Click2Connect_v2026.07.10/` folder
-3. Paste to USB drive or cloud storage
+2. Copy the latest `Click2Connect_v<TIMESTAMP>.exe`
+3. Paste it to USB drive or cloud storage
 
 ### On Target System (Other PC)
-1. **Paste the entire folder** anywhere on the target system
+1. **Paste the EXE** anywhere on the target system
    - No installation needed
    - No Python installation needed
    - Works on Windows 10/11 64-bit
 
-2. **Double-click:**
-   - `Click2Connect_v2026.07.10.exe`
+2. **Double-click the timestamped EXE**
 
 3. **Wait 10 seconds** for server to start
 
