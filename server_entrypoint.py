@@ -16,15 +16,138 @@ Robustness:
   PYI-3664 hides less information.
 """
 
+import logging
 import os
 import socket
+import sys
 import threading
 import time
 import traceback
 import webbrowser
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 
 APP_URL = "http://127.0.0.1:8000/"
+
+
+class _LogStream:
+    def __init__(self, logger: logging.Logger, level: int, target_stream=None) -> None:
+        self._logger = logger
+        self._level = level
+        self._target_stream = target_stream
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def write(self, message: str) -> int:
+        message = str(message)
+        if self._target_stream is not None:
+            self._target_stream.write(message)
+        with self._lock:
+            self._buffer += message
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if line.strip():
+                    self._logger.log(self._level, line.rstrip("\r"))
+        return len(message)
+
+    def flush(self) -> None:
+        if self._target_stream is not None:
+            self._target_stream.flush()
+        with self._lock:
+            if self._buffer.strip():
+                self._logger.log(self._level, self._buffer.rstrip("\r"))
+            self._buffer = ""
+
+    def isatty(self) -> bool:
+        return bool(
+            self._target_stream is not None
+            and getattr(self._target_stream, "isatty", lambda: False)()
+        )
+
+
+def _configure_logging() -> None:
+    app_dir = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parent
+    )
+    logs_dir = app_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        logs_dir / "click2connect.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "[%(levelname)s] %(asctime)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    sys.stdout = _LogStream(logging.getLogger("stdout"), logging.INFO, sys.stdout)
+    sys.stderr = _LogStream(logging.getLogger("stderr"), logging.ERROR, sys.stderr)
+
+
+def _disable_console_close_button() -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetConsoleWindow.restype = wintypes.HWND
+    kernel32.GetConsoleProcessList.argtypes = [
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.DWORD,
+    ]
+    kernel32.GetConsoleProcessList.restype = wintypes.DWORD
+    process_ids = (wintypes.DWORD * 64)()
+    attached_processes = kernel32.GetConsoleProcessList(process_ids, len(process_ids))
+    if attached_processes != 1:
+        return
+    console_window = kernel32.GetConsoleWindow()
+    if not console_window:
+        return
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetSystemMenu.argtypes = [wintypes.HWND, wintypes.BOOL]
+    user32.GetSystemMenu.restype = wintypes.HMENU
+    user32.EnableMenuItem.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT]
+    user32.EnableMenuItem.restype = wintypes.UINT
+    user32.GetMenuItemCount.argtypes = [wintypes.HMENU]
+    user32.GetMenuItemCount.restype = ctypes.c_int
+    user32.GetMenuItemID.argtypes = [wintypes.HMENU, ctypes.c_int]
+    user32.GetMenuItemID.restype = wintypes.UINT
+    user32.DeleteMenu.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT]
+    user32.DeleteMenu.restype = wintypes.BOOL
+    user32.DrawMenuBar.argtypes = [wintypes.HWND]
+    user32.DrawMenuBar.restype = wintypes.BOOL
+    system_menu = user32.GetSystemMenu(console_window, False)
+    if not system_menu:
+        return
+
+    sc_close = 0xF060
+    sc_minimize = 0xF020
+    sc_maximize = 0xF030
+    mf_byposition = 0x00000400
+    mf_bycommand = 0x00000000
+    mf_grayed = 0x00000001
+    item_count = user32.GetMenuItemCount(system_menu)
+    if item_count < 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    for position in range(item_count - 1, -1, -1):
+        command = user32.GetMenuItemID(system_menu, position)
+        if command not in (sc_minimize, sc_maximize, sc_close):
+            if not user32.DeleteMenu(system_menu, position, mf_byposition):
+                raise ctypes.WinError(ctypes.get_last_error())
+    if user32.EnableMenuItem(
+        system_menu, sc_close, mf_bycommand | mf_grayed
+    ) == 0xFFFFFFFF:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not user32.DrawMenuBar(console_window):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _log_error(msg: str) -> None:
@@ -83,6 +206,9 @@ def _start_tray_icon() -> None:
 
 def main() -> int:
     try:
+        _configure_logging()
+        _disable_console_close_button()
+
         # Ensure Django settings are discoverable
         os.environ.setdefault("DJANGO_SETTINGS_MODULE", "plc_connect.settings")
 

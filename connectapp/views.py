@@ -1203,8 +1203,6 @@ class AsyncBridgeService:
         return left == right
 
     def _log_cycle_values(self, payload, snapshot_map, previous_sync_times):
-        if self.sql_logger is None:
-            return
         plc = payload.get('plc') or {}
         bridge = payload.get('bridge') or {}
         data_type_map = bridge.get('data_type_map') or {}
@@ -1226,7 +1224,24 @@ class AsyncBridgeService:
                 'scada_value': snapshot.get('scada_value'),
                 'data_type': str(data_type_map.get(node_id) or ''),
             })
-        self.sql_logger.enqueue(records)
+        for record in records:
+            log_record = {
+                'recorded_at': record.get('recorded_at'),
+                'bridge_slot': record.get('bridge_slot'),
+                'plc_brand': record.get('plc_brand'),
+                'plc_connection': record.get('plc_connection'),
+                'tag_address': record.get('tag_address'),
+                'opcua_node_id': record.get('opcua_node_id'),
+                'plc_value': record.get('value'),
+                'scada_value': record.get('scada_value'),
+                'data_type': record.get('data_type'),
+            }
+            print(
+                '[Data Exchange] '
+                f'{json.dumps(log_record, default=str, separators=(",", ":"))}'
+            )
+        if self.sql_logger is not None:
+            self.sql_logger.enqueue(records)
 
     @staticmethod
     def _parse_modbus_tag(plc_tag):

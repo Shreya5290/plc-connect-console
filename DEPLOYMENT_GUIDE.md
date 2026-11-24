@@ -60,6 +60,11 @@ C:\Users\a00587102\plc_connect\dist_portable\Click2Connect_v<TIMESTAMP>.exe
 5. **Click2Connect remains in the Windows notification area**
    - Double-click the tray icon or choose **Open Click2Connect** to reopen the UI
    - Choose **Exit Click2Connect** from the tray menu to stop the application
+   - The console window keeps Minimize and Maximize available; Close is disabled, and the system menu contains no other options
+   - Closing the browser does not stop the bridge
+   - Normal application output appears in the console and is saved to `logs/click2connect.log` with rotation
+   - The log includes each newly synced PLC/SCADA value with its tag, OPC UA node, timestamp, and data type; SQL logging is not required
+   - SQL Server logging remains separately configurable and is not changed
 
 ---
 
